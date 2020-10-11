@@ -2499,7 +2499,6 @@ def _can_call_numpy_array(x):
 
 @_wraps(np.asarray)
 def asarray(a, dtype=None, order=None):
-  lax._check_user_dtype_supported(dtype, "asarray")
   return array(a, dtype=dtype, copy=False, order=order)
 
 
