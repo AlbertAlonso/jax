@@ -25,7 +25,7 @@ device computation along with ``transforms`` sequence, described below).
 A few examples::
 
   # calls func(2x, []) on host and returns 2x
-  y = id_tap(func, 2 * x)
+  w = id_tap(func, 2 * x)
   # calls func((2x, 3x), []) and returns (2x, 3x)
   y, z = id_tap(func, (2 * x, 3 * x))  # The argument can be a pytree
   # calls func(2x, []) and returns y
@@ -655,10 +655,10 @@ def _rewrite_eqn(eqn: core.JaxprEqn, eqns: List[core.JaxprEqn],
                     for jaxpr in branches),
                 linear=(*linear, False)), eqn.source_info))
   elif eqn.primitive is lax.scan_p:
-    num_consts, num_carry, carry_jaxpr, linear, _, _, _ = util.split_dict(
+    num_consts, num_carry, carry_jaxpr, linear, _, _, _, _ = util.split_dict(
         eqn.params,
         ["num_consts", "num_carry", "jaxpr", "linear", "reverse", "length",
-         "unroll"])
+         "unroll", "axis"])
     # We add the token right at the end of carry
     nr_const_and_carry = num_consts + num_carry
     new_invars = eqn.invars[0:nr_const_and_carry] + [

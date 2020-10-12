@@ -120,7 +120,6 @@ def _typecheck_param(prim, param, name, msg_required, pred):
   msg = sep.join([msg, param_str])
   core.typecheck_assert(pred, msg)
 
-
 ### fori_loop and while_loop
 
 def _fori_cond_fun(loop_carry):
@@ -1113,7 +1112,7 @@ core.custom_typechecks[cond_p] = _cond_typecheck
 
 ### scan
 
-def scan(f, init, xs, length=None, reverse=False, unroll=1):
+def scan(f, init, xs, length=None, reverse=False, unroll=1, axis=0):
   """Scan a function over leading array axes while carrying along state.
 
   The type signature in brief is
@@ -1179,7 +1178,8 @@ def scan(f, init, xs, length=None, reverse=False, unroll=1):
     unroll: optional positive int specifying, in the underlying operation of the
       scan primitive, how many scan iterations to unroll within a single
       iteration of a loop.
-
+    axis: optional non-negative int specifying the leading axis on which the
+      loop will be performed.
   Returns:
     A pair of type ``(c, [b])`` where the first element represents the final
     loop carry value and the second element represents the stacked outputs of
@@ -1188,24 +1188,27 @@ def scan(f, init, xs, length=None, reverse=False, unroll=1):
   xs_flat, xs_tree = tree_flatten(xs)
 
   try:
-    lengths = [x.shape[0] for x in xs_flat]
+    lengths = [x.shape[axis] for x in xs_flat]
   except AttributeError as err:
     msg = "scan got value with no leading axis to scan over: {}."
     raise ValueError(
       msg.format(', '.join(str(x) for x in xs_flat
                            if not hasattr(x, 'shape')))) from err
+  except IndexError:
+    msg = "scan got leading axis larger than input dimension"
+    raise IndexError(msg)
 
   if length is not None:
     length = int(length)
     if not all(length == l for l in lengths):
       msg = ("scan got `length` argument of {} which disagrees with "
              "leading axis sizes {}.")
-      raise ValueError(msg.format(length, [x.shape[0] for x in xs_flat]))
+      raise ValueError(msg.format(length, [x.shape[axis] for x in xs_flat]))
   else:
     unique_lengths = set(lengths)
     if len(unique_lengths) > 1:
       msg = "scan got values with different leading axis sizes: {}."
-      raise ValueError(msg.format(', '.join(str(x.shape[0]) for x in xs_flat)))
+      raise ValueError(msg.format(', '.join(str(x.shape[axis]) for x in xs_flat)))
     elif len(unique_lengths) == 0:
       msg = "scan got no values to scan over and `length` not provided."
       raise ValueError(msg)
@@ -1225,7 +1228,12 @@ def scan(f, init, xs, length=None, reverse=False, unroll=1):
     ys = tree_multimap(stack, *maybe_reversed(ys))
     return carry, ys
 
-  x_shapes = [masking.padded_shape_as_value(x.shape[1:]) for x in xs_flat]
+  def get_shape(x):
+    shape = list(x.shape)
+    del shape[axis]
+    return shape
+
+  x_shapes = [masking.padded_shape_as_value(get_shape(x)) for x in xs_flat]
   x_dtypes = [x.dtype for x in xs_flat]
   x_avals = tuple(_map(ShapedArray, x_shapes, x_dtypes))
 
@@ -1263,11 +1271,11 @@ def scan(f, init, xs, length=None, reverse=False, unroll=1):
                     reverse=reverse, length=length, jaxpr=jaxpr,
                     num_consts=len(consts), num_carry=len(init_flat),
                     linear=(False,) * (len(consts) + len(in_flat)),
-                    unroll=unroll)
+                    unroll=unroll, axis=axis)
   return tree_unflatten(out_tree, out)
 
 def _scan_impl_unrolled(*args, reverse, length, num_consts, num_carry, linear,
-                        f_impl, x_avals, y_avals):
+                        f_impl, x_avals, y_avals, axis):
   consts, init, xs = split_list(args, [num_consts, num_carry])
 
   carry = init
@@ -1275,7 +1283,7 @@ def _scan_impl_unrolled(*args, reverse, length, num_consts, num_carry, linear,
 
   for i in range(length):
     i_ = length - i - 1 if reverse else i
-    x = _map(partial(_index_array, i_), x_avals, xs)
+    x = _map(partial(_index_array, i_, axis=axis), x_avals, xs)
     out = f_impl(*consts, *carry, *x)
     carry, y = split_list(out, [num_carry])
     ys.append(y)
@@ -1286,7 +1294,7 @@ def _scan_impl_unrolled(*args, reverse, length, num_consts, num_carry, linear,
   return (*carry, *ys)
 
 def _scan_impl_loop(*args, reverse, length, num_consts, num_carry, linear,
-                    f_impl, x_avals, y_avals):
+                    f_impl, x_avals, y_avals, axis):
   consts, init, xs = split_list(args, [num_consts, num_carry])
 
   def cond_fun(vals):
@@ -1296,7 +1304,7 @@ def _scan_impl_loop(*args, reverse, length, num_consts, num_carry, linear,
   def body_fun(vals):
     [i], carry, ys = split_list(vals, [1, num_carry])
     i_ = length - i - 1 if reverse else i
-    x = _map(partial(_dynamic_index_array, i_), x_avals, xs)
+    x = _map(partial(_dynamic_index_array, i_, axis=axis), x_avals, xs)
     out_flat = f_impl(*consts, *carry, *x)
     carry_out, y_updates = split_list(out_flat, [num_carry])
     ys_out = _map(partial(_update_array, i_), y_avals, ys, y_updates)
@@ -1311,7 +1319,8 @@ def _scan_impl_loop(*args, reverse, length, num_consts, num_carry, linear,
     return outs
 
 def _scan_impl_block_unrolled(*args, reverse, length, num_consts, num_carry,
-                              linear, block_length, f_impl, x_avals, y_avals):
+                              linear, block_length, f_impl, x_avals, y_avals,
+                              axis):
   consts, init, xs = split_list(args, [num_consts, num_carry])
 
   num_blocks, rem = divmod(length, block_length)
@@ -1327,12 +1336,13 @@ def _scan_impl_block_unrolled(*args, reverse, length, num_consts, num_carry,
   f_impl_block = partial(
       _scan_impl_unrolled, reverse=reverse, length=block_length,
       num_consts=num_consts, num_carry=num_carry, linear=linear,
-      f_impl=f_impl, x_avals=x_avals, y_avals=y_avals)
+      f_impl=f_impl, x_avals=x_avals, y_avals=y_avals, axis=axis)
 
   outs = _scan_impl_loop(
       *consts, *init, *xs_block, reverse=reverse, length=num_blocks,
       num_consts=num_consts, num_carry=num_carry, linear=linear,
-      f_impl=f_impl_block, x_avals=x_block_avals, y_avals=y_block_avals)
+      f_impl=f_impl_block, x_avals=x_block_avals, y_avals=y_block_avals,
+      axis=axis)
 
   carry, ys_blocks = split_list(outs, [num_carry])
   combine = partial(_combine_leading, num_blocks, block_length)
@@ -1340,7 +1350,7 @@ def _scan_impl_block_unrolled(*args, reverse, length, num_consts, num_carry,
   return (*carry, *ys)
 
 def _scan_impl(*args, reverse, length, num_consts, num_carry, jaxpr, linear,
-               unroll):
+               unroll, axis):
   _, _, x_avals = split_list(jaxpr.in_avals, [num_consts, num_carry])
   _, y_avals = split_list(jaxpr.out_avals, [num_carry])
   f_impl = core.jaxpr_as_fun(jaxpr)
@@ -1349,7 +1359,7 @@ def _scan_impl(*args, reverse, length, num_consts, num_carry, jaxpr, linear,
     return _scan_impl_loop(
         *args, reverse=reverse, length=length, num_consts=num_consts,
         num_carry=num_carry, linear=linear, f_impl=f_impl, x_avals=x_avals,
-        y_avals=y_avals)
+        y_avals=y_avals, axis=axis)
 
   consts, init, xs = split_list(args, [num_consts, num_carry])
   num_blocks, rem = divmod(length, unroll)
@@ -1366,7 +1376,8 @@ def _scan_impl(*args, reverse, length, num_consts, num_carry, jaxpr, linear,
   outs = _scan_impl_block_unrolled(
       *consts, *init, *xs, reverse=reverse, length=length_div,
       num_consts=num_consts, num_carry=num_carry, linear=linear,
-      block_length=unroll, f_impl=f_impl, x_avals=x_avals, y_avals=y_avals)
+      block_length=unroll, f_impl=f_impl, x_avals=x_avals, y_avals=y_avals,
+      axis=axis)
 
   carry, ys = split_list(outs, [num_carry])
 
@@ -1374,7 +1385,7 @@ def _scan_impl(*args, reverse, length, num_consts, num_carry, jaxpr, linear,
     outs = _scan_impl_unrolled(
         *consts, *carry, *xs_rem, reverse=reverse, length=rem,
         num_consts=num_consts, num_carry=num_carry, linear=linear,
-        f_impl=f_impl, x_avals=x_avals, y_avals=y_avals)
+        f_impl=f_impl, x_avals=x_avals, y_avals=y_avals, axis=axis)
     carry, ys_rem = split_list(outs, [num_carry])
     if reverse:
       ys = _map(_concatenate, y_avals, ys_rem, ys)
@@ -1404,17 +1415,17 @@ def _split_leading_dim(i, aval, x):
     return (lax.slice_in_dim(x, 0, i),
             lax.slice_in_dim(x, i, x.shape[0]))
 
-def _dynamic_index_array(i, aval, x):
+def _dynamic_index_array(i, aval, x, axis=0):
   if aval is core.abstract_unit:
     return core.unit
   else:
-    return lax.dynamic_index_in_dim(x, i, keepdims=False)
+    return lax.dynamic_index_in_dim(x, i, axis=axis, keepdims=False)
 
-def _index_array(i, aval, x):
+def _index_array(i, aval, x, axis=0):
   if aval is core.abstract_unit:
     return core.unit
   else:
-    return lax.index_in_dim(x, i, keepdims=False)
+    return lax.index_in_dim(x, i, axis=axis, keepdims=False)
 
 def _empty_array(sz, aval):
   if aval is core.abstract_unit:
@@ -1454,14 +1465,14 @@ def _prepend_dim_to_aval(sz, aval):
     raise TypeError(f'Prepending dim {sz} to aval {aval}')
 
 def _scan_abstract_eval(*args, reverse, length, num_consts, num_carry, jaxpr,
-                        linear, unroll):
+                        linear, unroll, axis):
   carry_avals, y_avals = split_list(jaxpr.out_avals, [num_carry])
   ys_avals = [ShapedArray((length,) + aval.shape, aval.dtype)
               if aval is not core.abstract_unit else aval for aval in y_avals]
   return carry_avals + ys_avals
 
 def _scan_jvp(primals, tangents, reverse, length, jaxpr, num_consts, num_carry,
-              linear, unroll):
+              linear, unroll, axis):
   num_xs = len(jaxpr.in_avals) - num_carry - num_consts
   num_ys = len(jaxpr.out_avals) - num_carry
   nonzeros = [type(t) is not ad_util.Zero for t in tangents]
@@ -1507,7 +1518,7 @@ def _scan_jvp(primals, tangents, reverse, length, jaxpr, num_consts, num_carry,
       reverse=reverse, length=length, jaxpr=jaxpr_jvp_rearranged,
       num_consts=num_consts + len(consts_dot),
       num_carry=num_carry + len(init_dot),
-      linear=jaxpr_jvp_linear, unroll=unroll)
+      linear=jaxpr_jvp_linear, unroll=unroll, axis=axis)
 
   carry, carry_dot, ys, ys_dot = split_list(out_flat, [num_carry, len(init_dot), num_ys])
   primals_out = carry + ys
@@ -1520,11 +1531,11 @@ def _prune_zeros(ts):
   return [t for t in ts if type(t) is not ad_util.Zero]
 
 def _scan_partial_eval(trace, *tracers, reverse, length, num_consts, num_carry,
-                       jaxpr, linear, unroll):
+                       jaxpr, linear, unroll, axis):
   if not config.omnistaging_enabled and trace.main.trace_type is pe.StagingJaxprTrace:  # type: ignore
     params = dict(reverse=reverse, length=length, num_consts=num_consts,
                   num_carry=num_carry, jaxpr=jaxpr, linear=linear,
-                  unroll=unroll)
+                  unroll=unroll, axis=axis)
     return trace.default_process_primitive(scan_p, tracers, params)
 
   num_ys = len(jaxpr.out_avals) - num_carry
@@ -1599,7 +1610,7 @@ def _scan_partial_eval(trace, *tracers, reverse, length, num_consts, num_carry,
   out_flat = scan_p.bind(
       *in_consts, reverse=reverse, length=length, jaxpr=jaxpr_1_opt,
       num_consts=num_consts_1, num_carry=num_carry, linear=tuple(linear_1),
-      unroll=unroll)
+      unroll=unroll, axis=axis)
 
   # Propagate the forwarded extensive outputs using fwd_extensive. Any
   # numpy.ndarray inputs should be converted to JAX DeviceArrays.
@@ -1635,7 +1646,7 @@ def _scan_partial_eval(trace, *tracers, reverse, length, num_consts, num_carry,
                           dict(reverse=reverse, length=length, jaxpr=jaxpr_2_opt,
                                num_consts=num_consts_2,
                                num_carry=num_carry, linear=tuple(linear_2),
-                               unroll=unroll),
+                               unroll=unroll, axis=axis),
                           source_info_util.current())
   for t in out_tracers: t.recipe = eqn
   return out_tracers
@@ -1653,7 +1664,7 @@ def _promote_aval_rank(sz, aval):
     return ShapedArray((sz,) + aval.shape, aval.dtype)
 
 def _scan_transpose(cts, *args, reverse, length, num_consts, num_carry, jaxpr,
-                    linear, unroll):
+                    linear, unroll, axis):
   # we've only implemented transposing scans with specific lin/nonlin patterns
   consts_lin, init_lin, xs_lin = split_list(linear, [num_consts, num_carry])
   num_ires = len(consts_lin) - sum(consts_lin)
@@ -1690,7 +1701,7 @@ def _scan_transpose(cts, *args, reverse, length, num_consts, num_carry, jaxpr,
       *(ires + ct_consts + ct_carry + ct_ys + eres), reverse=not reverse,
       length=length, jaxpr=jaxpr_trans, num_consts=num_ires,
       num_carry=num_consts-num_ires+num_carry, linear=tuple(linear_trans),
-      unroll=unroll)
+      unroll=unroll, axis=axis)
   ct_consts, ct_init, ct_xs = split_list(outs, [num_consts - num_ires, num_carry])
   return [None] * num_ires + ct_consts + ct_init + ct_xs + [None] * num_eres
 
@@ -1728,7 +1739,7 @@ def _make_closed_jaxpr(traceable: lu.WrappedFun, in_avals: Sequence[core.Abstrac
 
 
 def _scan_batching_rule(args, dims, reverse, length, jaxpr, num_consts,
-                        num_carry, linear, unroll):
+                        num_carry, linear, unroll, axis):
   num_ys = len(jaxpr.out_avals) - num_carry
   size, = {x.shape[d] for x, d in zip(args, dims) if d is not batching.not_mapped}
   orig_batched = [d is not batching.not_mapped for d in dims]
@@ -1766,13 +1777,14 @@ def _scan_batching_rule(args, dims, reverse, length, jaxpr, num_consts,
 
   outs = scan_p.bind(
       *new_args, reverse=reverse, length=length, jaxpr=jaxpr_batched,
-      num_consts=num_consts, num_carry=num_carry, linear=linear, unroll=unroll)
+      num_consts=num_consts, num_carry=num_carry, linear=linear, unroll=unroll,
+      axis=axis)
   carry_bdims = [0 if b else batching.not_mapped for b in carry_batched]
   ys_bdims = [1 if b else batching.not_mapped for b in ys_batched]
   return outs, carry_bdims + ys_bdims
 
 def _scan_masking_rule(padded_vals, logical_shapes, reverse, length,
-                       jaxpr, num_consts, num_carry, linear, unroll):
+                       jaxpr, num_consts, num_carry, linear, unroll, axis):
   dynamic_length, = masking.shape_as_value((length,))
   masked_jaxpr = _masked_scan_jaxpr(jaxpr, num_consts, num_carry)
   consts, init, xs = split_list(padded_vals, [num_consts, num_carry])
@@ -1783,7 +1795,7 @@ def _scan_masking_rule(padded_vals, logical_shapes, reverse, length,
       reverse=reverse, length=max_length, jaxpr=masked_jaxpr,
       num_consts=1 + num_consts, num_carry=1 + num_carry,
       linear=tuple([False] + const_linear + [False] + init_linear + xs_linear),
-      unroll=unroll)
+      unroll=unroll, axis=axis)
   return out_vals[1:]
 
 def _masked_scan_jaxpr(jaxpr, num_consts, num_carry):
@@ -1804,7 +1816,7 @@ def _masked_scan_jaxpr(jaxpr, num_consts, num_carry):
   return _make_closed_jaxpr(masked, [aval] + const_avals + [aval] + carry_avals + x_avals)
 
 def _scan_typecheck(bind_time, *avals, reverse, length, num_consts, num_carry,
-                    jaxpr, linear, unroll):
+                    jaxpr, linear, unroll, axis):
   tc = partial(_typecheck_param, 'scan')
   tc(reverse, 'reverse', 'bool', type(reverse) is bool)
   tc(num_consts, 'num_consts', 'non-negative int',
@@ -1815,6 +1827,7 @@ def _scan_typecheck(bind_time, *avals, reverse, length, num_consts, num_carry,
   tc(linear, 'linear', 'tuple of bool',
      type(linear) is tuple and all(type(x) is bool for x in linear))
   tc(unroll, 'unroll', 'positive int', type(unroll) is int and unroll > 0)
+  tc(axis, 'axis', 'non-negative int', type(axis) is int and axis >= 0)
 
   length_types = (int, masking.Poly) if bind_time else (int,)
   tc(length, 'length', 'non-negative int',

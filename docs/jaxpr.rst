@@ -368,7 +368,8 @@ For the example consider the function ``func11`` below
 { lambda  ; a b.
   let c = broadcast_in_dim[ broadcast_dimensions=(  )
                             shape=(16,) ] 1.0
-      d e = scan[ jaxpr={ lambda  ; a b c d.
+      d e = scan[ axis=0
+                  jaxpr={ lambda  ; a b c d.
                           let e = mul c d
                               f = add b e
                               g = add f a
