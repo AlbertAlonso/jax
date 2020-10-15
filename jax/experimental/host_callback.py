@@ -25,7 +25,7 @@ device computation along with ``transforms`` sequence, described below).
 A few examples::
 
   # calls func(2x, []) on host and returns 2x
-  w = id_tap(func, 2 * x)
+  y = id_tap(func, 2 * x)
   # calls func((2x, 3x), []) and returns (2x, 3x)
   y, z = id_tap(func, (2 * x, 3 * x))  # The argument can be a pytree
   # calls func(2x, []) and returns y
