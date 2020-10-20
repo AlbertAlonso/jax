@@ -2511,6 +2511,21 @@ class LaxControlFlowTest(jtu.JaxTestCase):
     *_, ext_res = vjp_fun.args[0].args[0]
     self.assertIsInstance(ext_res, xla.DeviceArray)
 
+  def test_scan_over_new_axis(self):
+    # This test the iteration over the new axis works as expected.
+    f = lambda carry, x: (carry + x.max(), x.max())
+    xs = jnp.ones((10, 5, 2, 4))
+    for axis in range(4):
+      out, y = lax.scan(f, 0., xs, axis=axis)
+      self.assertEqual(out, xs.shape[axis])
+      self.assertArraysEqual(y, jnp.ones(xs.shape[axis]))
+
+  def test_scan_axis_error_msg(self):
+    # Test that the proper exception is raised when axis>xs.dim.
+    f = lambda carry, x: (carry + x.max(), x.max())
+    xs = jnp.ones((2,2))
+    with self.assertRaises(IndexError):
+      _ = lax.scan(f, 0, xs, axis=3)
 
 
 if __name__ == '__main__':

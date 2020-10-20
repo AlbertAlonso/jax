@@ -1212,13 +1212,15 @@ def axis_frame(axis_name):
 
 # ------------------- Jaxpr checking -------------------
 
-def mapped_aval(size: int, aval: AbstractValue) -> AbstractValue:
+def mapped_aval(size: int, aval: AbstractValue, axis: int=0) -> AbstractValue:
   if aval is abstract_unit:
     return aval
   elif isinstance(aval, ShapedArray):
     # might be raising abstraction level from Concrete here
-    assert aval.shape[0] == size
-    return ShapedArray(aval.shape[1:], aval.dtype)
+    assert aval.shape[axis] == size
+    new_shape = list(aval.shape)
+    del new_shape[axis]
+    return ShapedArray(new_shape, aval.dtype)
   else:
     raise TypeError(f"Mapped operand {aval}")
 
