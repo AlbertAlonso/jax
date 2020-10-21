@@ -1190,43 +1190,58 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
                         check_dtypes=False)
 
   @parameterized.named_parameters(jtu.cases_from_list(
-      {"testcase_name": "_shape={}_mode={}_rpadwidth={}_rconstantvalues={}".format(
-          jtu.format_shape_dtype_string(shape, dtype), mode, pad_width_rank,
-          constant_values_rank),
+      {"testcase_name": "_shape={}_mode={}_padwidth={}_constantvalues={}".format(
+          jtu.format_shape_dtype_string(shape, dtype), mode, pad_width,
+          constant_values),
        "shape": shape, "dtype": dtype, "mode": mode,
-       "pad_width_rank": pad_width_rank,
-       "constant_values_rank": constant_values_rank,
-       "rng_factory": jtu.rand_default,
-       "irng_factory": partial(jtu.rand_int, high=3)}
-      for mode, constant_values_rank, shapes in [
-        ('constant', 0, all_shapes),
-        ('constant', 1, all_shapes),
-        ('constant', 2, all_shapes),
-        ('symmetric', None, nonempty_shapes),
-        ('reflect', None, nonempty_shapes),
-        ('wrap', None, nonempty_shapes),
-        ('edge', None, nonempty_shapes),
+       "pad_width": pad_width, "constant_values": constant_values,
+       "rng_factory": jtu.rand_default}
+      for mode, shapes in [
+          ('constant', all_shapes),
+          ('symmetric', nonempty_shapes),
+          ('reflect', nonempty_shapes),
+          ('wrap', nonempty_shapes),
+          ('edge', nonempty_shapes),
       ]
       for shape, dtype in _shape_and_dtypes(shapes, all_dtypes)
-      for pad_width_rank in range(3)))
-  def testPad(self, shape, dtype, mode, pad_width_rank, constant_values_rank,
-              rng_factory, irng_factory):
+      for constant_values in [
+          # None is used for modes other than 'constant'
+          None,
+          # constant
+          0, 1,
+          # (constant,)
+          (0,), (2.718,),
+          # ((before_const, after_const),)
+          ((0, 2),), ((-1, 3.14),),
+          # ((before_1, after_1), ..., (before_N, after_N))
+          tuple((i / 2, -3.14 * i) for i in range(len(shape))),
+      ]
+      for pad_width in [
+        # ((before_1, after_1), ..., (before_N, after_N))
+        tuple((i % 3, (i + 1) % 3) for i in range(len(shape))),
+        # ((before, after),)
+        ((1, 2),), ((2, 0),),
+        # (before, after)  (not in the docstring but works in numpy)
+        (2, 0), (0, 0),
+        # (pad,)
+        (1,), (2,),
+        # pad
+        0, 1,
+      ]
+      if (pad_width != () and constant_values != () and
+          ((mode == 'constant' and constant_values is not None) or
+           (mode != 'constant' and constant_values is None)))))
+  def testPad(self, shape, dtype, mode, pad_width, constant_values, rng_factory):
     rng = rng_factory(self.rng())
-    irng = irng_factory(self.rng())
-    pad_width = irng([len(shape), 2][2 - pad_width_rank:], np.int32)
-    def np_fun(x, kwargs):
-      if pad_width.size == 0:
-        return x
-      return np.pad(x, pad_width, mode=mode, **kwargs)
-    def jnp_fun(x, kwargs):
-      return jnp.pad(x, pad_width, mode=mode, **kwargs)
-
-    def args_maker():
-      kwargs = {}
-      if constant_values_rank:
-        kwargs["constant_values"] = rng(
-          [len(shape), 2][2 - constant_values_rank:], dtype)
-      return rng(shape, dtype), kwargs
+    args_maker = lambda: [rng(shape, dtype)]
+    if constant_values is None:
+      np_fun = partial(np.pad, pad_width=pad_width, mode=mode)
+      jnp_fun = partial(jnp.pad, pad_width=pad_width, mode=mode)
+    else:
+      np_fun = partial(np.pad, pad_width=pad_width, mode=mode,
+                       constant_values=constant_values)
+      jnp_fun = partial(jnp.pad, pad_width=pad_width, mode=mode,
+                        constant_values=constant_values)
 
     self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker,
                             check_dtypes=shape is not jtu.PYTHON_SCALAR_SHAPE)
@@ -2334,10 +2349,38 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
       "weights": weights,
       "density": density
     }
+    for shape in [(5,), (12,)]
+    for dtype in int_dtypes
+    for bins in [2, [2, 2], [[0, 1, 3, 5], [0, 2, 3, 4, 6]]]
+    for weights in [False, True]
+    for density in [False, True]
+  ))
+  def testHistogram2d(self, shape, dtype, bins, weights, density):
+    rng = jtu.rand_default(self.rng())
+    _weights = lambda w: abs(w) if weights else None
+    np_fun = lambda a, b, w: np.histogram2d(a, b, bins=bins, weights=_weights(w), density=density)
+    jnp_fun = lambda a, b, w: jnp.histogram2d(a, b, bins=bins, weights=_weights(w), density=density)
+    args_maker = lambda: [rng(shape, dtype), rng(shape, dtype), rng(shape, dtype)]
+    tol = {jnp.bfloat16: 2E-2, np.float16: 1E-1}
+    # np.searchsorted errors on bfloat16 with
+    # "TypeError: invalid type promotion with custom data type"
+    with np.errstate(divide='ignore', invalid='ignore'):
+        if dtype != jnp.bfloat16:
+            self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker, check_dtypes=False,
+                              tol=tol)
+    self._CompileAndCheck(jnp_fun, args_maker)
+
+  @parameterized.named_parameters(jtu.cases_from_list(
+    {"testcase_name": "_{}_bins={}_weights={}_density={}".format(
+      jtu.format_shape_dtype_string(shape, dtype), bins, weights, density),
+      "shape": shape,
+      "dtype": dtype,
+      "bins": bins,
+      "weights": weights,
+      "density": density
+    }
     for shape in [(5, 3), (10, 3)]
     for dtype in int_dtypes
-    # We only test explicit integer-valued bin edges because in other cases
-    # rounding errors lead to flaky tests.
     for bins in [(2, 2, 2), [[-5, 0, 4], [-4, -1, 2], [-6, -1, 4]]]
     for weights in [False, True]
     for density in [False, True]
@@ -3653,7 +3696,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
   def testIssue776(self):
     """Tests that the scatter-add transpose rule instantiates symbolic zeros."""
     def f(u):
-      y = jax.ops.index_add(np.ones(10,), [2, 4, 5], u)
+      y = jnp.ones(10).at[np.array([2, 4, 5])].add(u)
       # The transpose rule for lax.tie_in returns a symbolic zero for its first
       # argument.
       return lax.tie_in(y, 7.)
@@ -3702,6 +3745,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
 
   def testIssue883(self):
     # from https://github.com/google/jax/issues/883
+    raise SkipTest("we decided to disallow arrays as static args")
 
     @partial(api.jit, static_argnums=(1,))
     def f(x, v):
@@ -3964,7 +4008,7 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     rng = rng_factory(self.rng())
     endpoints = rng((2,), dtype)
     out = jnp.linspace(*endpoints, 10, dtype=dtype)
-    self.assertAllClose(out[[0, -1]], endpoints, rtol=0, atol=0)
+    self.assertAllClose(out[np.array([0, -1])], endpoints, rtol=0, atol=0)
 
   @parameterized.named_parameters(
       jtu.cases_from_list(
@@ -4408,6 +4452,7 @@ class NumpySignaturesTest(jtu.JaxTestCase):
       'full_like': ['shape', 'subok', 'order'],
       'gradient': ['varargs', 'axis', 'edge_order'],
       'histogram': ['normed'],
+      'histogram2d': ['normed'],
       'histogramdd': ['normed'],
       'isneginf': ['out'],
       'isposinf': ['out'],

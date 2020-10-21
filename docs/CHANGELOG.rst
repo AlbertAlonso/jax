@@ -9,6 +9,31 @@ Change Log
 
 These are the release notes for JAX.
 
+jaxlib 0.1.57 (unreleased)
+------------------------------
+* Fixed a bug where the hash of bfloat16 values was not correctly initialized
+  and could change (#4651).
+* Add support for retaining ownership when passing arrays to DLPack (#4636).
+
+jax 0.2.4 (October 19 2020)
+--------------------------
+* `GitHub commits <https://github.com/google/jax/compare/jax-v0.2.3...jax-v0.2.4>`_.
+
+
+jaxlib 0.1.56 (October 14, 2020)
+------------------------------
+
+
+jax 0.2.3 (October 14 2020)
+--------------------------
+* `GitHub commits <https://github.com/google/jax/compare/jax-v0.2.2...jax-v0.2.3>`_.
+* The reason for another release so soon is we need to temporarily roll back a
+  new jit fastpath while we look into a performance degradation
+
+jax 0.2.2 (October 13 2020)
+--------------------------
+* `GitHub commits <https://github.com/google/jax/compare/jax-v0.2.1...jax-v0.2.2>`_.
+
 jax 0.2.1 (October 6 2020)
 --------------------------
 * `GitHub commits <https://github.com/google/jax/compare/jax-v0.2.0...jax-v0.2.1>`_.

@@ -29,7 +29,7 @@ import collections
 import operator
 import os
 import types
-from typing import Sequence, Set, Tuple, Union
+from typing import Sequence, FrozenSet, Tuple, Union
 from textwrap import dedent as _dedent
 import warnings
 
@@ -39,19 +39,19 @@ import opt_einsum
 import jax
 from jax import jit, custom_jvp
 from .vectorize import vectorize
-from ._util import _wraps
-from .. import core
-from .. import dtypes
-from ..abstract_arrays import UnshapedArray, ShapedArray, ConcreteArray, canonicalize_shape
-from ..config import flags, config
-from ..interpreters.xla import DeviceArray
-from ..interpreters.masking import Poly
-from .. import lax
-from ..lax.lax import _device_put_raw
-from .. import ops
-from ..util import (partial, unzip2, prod as _prod,
-                    subvals, safe_zip, canonicalize_axis as _canonicalize_axis)
-from ..tree_util import tree_leaves, tree_flatten
+from .util import _wraps
+from jax import core
+from jax import dtypes
+from jax.abstract_arrays import UnshapedArray, ShapedArray, ConcreteArray, canonicalize_shape
+from jax.config import flags, config
+from jax.interpreters.xla import DeviceArray
+from jax.interpreters.masking import Poly
+from jax import lax
+from jax._src.lax.lax import _device_put_raw
+from jax import ops
+from jax.util import (partial, unzip2, prod as _prod,
+                      subvals, safe_zip, canonicalize_axis as _canonicalize_axis)
+from jax.tree_util import tree_leaves, tree_flatten
 
 FLAGS = flags.FLAGS
 flags.DEFINE_enum(
@@ -69,8 +69,9 @@ _PRECISION_DOC = """\
 In addition to the original NumPy arguments listed below, also supports
 ``precision`` for extra control over matrix-multiplication precision
 on supported devices. ``precision`` may be set to ``None``, which means
-default precision for the backend, or any ``jax.lax.Precision`` enum value
-(``Precision.DEFAULT``, ``Precision.HIGH`` or ``Precision.HIGHEST``).
+default precision for the backend, a ``lax.Precision`` enum value
+(``Precision.DEFAULT``, ``Precision.HIGH`` or ``Precision.HIGHEST``) or a tuple
+of two ``lax.Precision`` enums indicating separate precision for each argument.
 """
 
 # We replace some builtin names to follow Numpy's API, so we capture here.
@@ -747,13 +748,13 @@ def correlate(a, v, mode='valid', *, precision=None):
 
 
 def _normalize_float(x):
-    info = finfo(_dtype(x))
-    cond = lax.abs(x) < info.tiny
-    x1 = where(cond, x * (1 << info.nmant), x)
-    x2 = where(cond,
-               full_like(x, -info.nmant, dtype=np.int32),
-               zeros_like(x, dtype=np.int32))
-    return lax.convert_element_type(x1, _dtype(x)), x2
+  info = finfo(_dtype(x))
+  cond = lax.abs(x) < info.tiny
+  x1 = where(cond, x * (1 << info.nmant), x)
+  x2 = where(cond, full_like(x, -info.nmant, dtype=np.int32),
+             zeros_like(x, dtype=np.int32))
+  return lax.convert_element_type(x1, _dtype(x)), x2
+
 
 _INT_DTYPES = {
   16: np.int16,
@@ -921,6 +922,22 @@ def histogram(a, bins=10, range=None, weights=None, density=None):
     counts = counts / bin_widths / counts.sum()
   return counts, bin_edges
 
+@_wraps(np.histogram2d)
+def histogram2d(x, y, bins=10, range=None, weights=None, density=None):
+
+  try:
+    N = len(bins)
+  except TypeError:
+    N = 1
+
+  if N != 1 and N != 2:
+    x_edges = y_edges = asarray(bins)
+    bins = [x_edges, y_edges]
+
+  sample = transpose(asarray([x, y]))
+  hist, edges = histogramdd(sample, bins, range, weights, density)
+  return hist, edges[0], edges[1]
+
 @_wraps(np.histogramdd)
 def histogramdd(sample, bins=10, range=None, weights=None, density=None):
   _check_arraylike("histogramdd", sample)
@@ -928,6 +945,14 @@ def histogramdd(sample, bins=10, range=None, weights=None, density=None):
 
   if weights is not None and weights.shape != (N,):
     raise ValueError("should have one weight for each sample.")
+
+  try:
+    num_bins = len(bins)
+    if num_bins != D:
+      raise ValueError("should be a bin for each dimension.")
+  except TypeError:
+    # when bin_size is integer, the same bin is used for each dimension
+    bins = D * [bins]
 
   bin_idx_by_dim = D*[None]
   nbins = np.empty(D, int)
@@ -1441,21 +1466,22 @@ def in1d(ar1, ar2, assume_unique=False, invert=False):
 
 @partial(jit, static_argnums=2)
 def _intersect1d_sorted_mask(ar1, ar2, return_indices=False):
-    """
+  """
     Helper function for intersect1d which is jit-able
     """
-    ar = concatenate((ar1, ar2))
-    if return_indices:
-      iota = lax.broadcasted_iota(np.int64, shape(ar), dimension=0)
-      aux, indices = lax.sort_key_val(ar, iota)
-    else:
-      aux = sort(ar)
+  ar = concatenate((ar1, ar2))
+  if return_indices:
+    iota = lax.broadcasted_iota(np.int64, shape(ar), dimension=0)
+    aux, indices = lax.sort_key_val(ar, iota)
+  else:
+    aux = sort(ar)
 
-    mask = aux[1:] == aux[:-1]
-    if return_indices:
-      return aux, mask, indices
-    else:
-      return aux, mask
+  mask = aux[1:] == aux[:-1]
+  if return_indices:
+    return aux, mask, indices
+  else:
+    return aux, mask
+
 
 @_wraps(np.intersect1d)
 def intersect1d(ar1, ar2, assume_unique=False, return_indices=False):
@@ -2252,7 +2278,34 @@ def _pad_edge(array, pad_width):
 def _pad(array, pad_width, mode, constant_values):
   array = asarray(array)
   nd = ndim(array)
-  pad_width = np.broadcast_to(np.asarray(pad_width), (nd, 2))
+
+  if nd == 0:
+    return array
+
+  pad_width_shape = np.shape(pad_width)
+  if pad_width_shape == (nd, 2):
+    # ((before_1, after_1), ..., (before_N, after_N))
+    pass
+  elif pad_width_shape == (1, 2):
+    # ((before, after),)
+    pad_width = pad_width * nd
+  elif pad_width_shape == (2,):
+    # (before, after)  (not in the numpy docstring but works anyway)
+    before, after = pad_width
+    pad_width = (pad_width,) * nd
+  elif pad_width_shape == (1,):
+    # (pad,)
+    pad_width, = pad_width
+    pad_width = ((pad_width, pad_width),) * nd
+  elif pad_width_shape == ():
+    # pad
+    pad_width = ((pad_width, pad_width),) * nd
+  else:
+    raise ValueError(f"pad_width given unexpected structure: {pad_width}. "
+                     "See docstring for valid pad_width formats.")
+  pad_width = np.array(pad_width)
+  assert pad_width.shape == (nd, 2), pad_width
+
   if np.any(pad_width < 0):
     raise ValueError("index can't contain negative values")
 
@@ -2272,10 +2325,13 @@ def _pad(array, pad_width, mode, constant_values):
     msg = "Unimplemented padding mode '{}' for np.pad."
     raise NotImplementedError(msg.format(mode))
 
+
 @_wraps(np.pad)
-def pad(array, pad_width, mode='constant', constant_values=0):
-  if isinstance(pad_width, list):
-    pad_width = tuple(pad_width)
+def pad(array, pad_width, mode="constant", constant_values=0):
+  if isinstance(pad_width, Sequence):
+    pad_width = tuple(
+        tuple(int(i) for i in x) if isinstance(x, Sequence) else x
+        for x in pad_width)
   return _pad(array, pad_width, mode, constant_values)
 
 
@@ -2500,6 +2556,7 @@ def _can_call_numpy_array(x):
 @_wraps(np.asarray)
 def asarray(a, dtype=None, order=None):
   lax._check_user_dtype_supported(dtype, "asarray")
+  dtype = dtypes.canonicalize_dtype(dtype) if dtype is not None else dtype
   return array(a, dtype=dtype, copy=False, order=order)
 
 
@@ -2750,7 +2807,7 @@ def meshgrid(*args, **kwargs):
     output.append(lax.broadcast_in_dim(a, s, (i,)))
 
   if indexing == "xy" and len(args) >= 2:
-      output[0], output[1] = output[1], output[0]
+    output[0], output[1] = output[1], output[0]
 
   return output
 
@@ -3249,8 +3306,9 @@ def tensordot(a, b, axes=2, *, precision=None):
       contracting_dims = (tuple(_canonicalize_axis(i, a_ndim) for i in ax1),
                           tuple(_canonicalize_axis(i, b_ndim) for i in ax2))
     else:
-        msg = "tensordot requires both axes lists to be either ints, tuples or lists, got {} and {}"
-        raise TypeError(msg.format(ax1, ax2))
+      msg = ("tensordot requires both axes lists to be either ints, tuples or "
+             "lists, got {} and {}")
+      raise TypeError(msg.format(ax1, ax2))
   else:
     msg = ("tensordot axes argument must be an int, a pair of ints, or a pair "
            "of lists/tuples of ints.")
@@ -3265,7 +3323,7 @@ def einsum(*operands, optimize='greedy', precision=None):
   # using einsum_call=True here is an internal api for opt_einsum
   operands, contractions = opt_einsum.contract_path(
       *operands, einsum_call=True, use_blas=True, optimize=optimize)
-  contractions = tuple(data[:3] for data in contractions)
+  contractions = tuple((a, frozenset(b), c) for a, b, c, *_ in contractions)
   return _einsum(operands, contractions, precision)
 
 @_wraps(np.einsum_path)
@@ -3278,7 +3336,7 @@ def _removechars(s, chars):
 
 @partial(jit, static_argnums=(1, 2))
 def _einsum(operands: Sequence,
-            contractions: Sequence[Tuple[Tuple[int, ...], Set[str], str]],
+            contractions: Sequence[Tuple[Tuple[int, ...], FrozenSet[str], str]],
             precision):
   operands = list(_promote_dtypes(*operands))
   def sum(x, axes):
@@ -3623,6 +3681,8 @@ def _roll(a, shift, axis):
 
 @_wraps(np.roll)
 def roll(a, shift, axis=None):
+  if isinstance(axis, list):
+    axis = tuple(axis)
   return _roll(a, shift, axis)
 
 
@@ -3993,7 +4053,7 @@ def _index_to_gather(x_shape, idx):
     idx_no_nones = [(i, d) for i, d in enumerate(idx) if d is not None]
     advanced_pairs = (
       (asarray(e), i, j) for j, (i, e) in enumerate(idx_no_nones)
-      if isinstance(e, (Sequence, ndarray)))
+      if isscalar(e) or isinstance(e, (Sequence, ndarray)))
     advanced_pairs = ((_normalize_index(e, x_shape[j]), i, j)
                       for e, i, j in advanced_pairs)
     advanced_indexes, idx_advanced_axes, x_advanced_axes = zip(*advanced_pairs)
@@ -4172,10 +4232,28 @@ def _eliminate_deprecated_list_indexing(idx):
   # deprecated by NumPy and exists for backward compatibility.
   if not isinstance(idx, tuple):
     if isinstance(idx, Sequence) and not isinstance(idx, ndarray):
+      # As of numpy 1.16, some non-tuple sequences of indices result in a warning, while
+      # others are converted to arrays, based on a set of somewhat convoluted heuristics
+      # (See https://github.com/numpy/numpy/blob/v1.19.2/numpy/core/src/multiarray/mapping.c#L179-L343)
+      # In JAX, we raise a warning for *all* non-tuple sequences, and in the future will
+      # *always* raise a TypeError here, rather than silently converting to an array or tuple
+      # depending on the contents of the list as numpy will. "Explicit is better than implicit".
+      # TODO(jakevdp): raise a TypeError here.
       if _any(_should_unpack_list_index(i) for i in idx):
+        msg = ("Using a non-tuple sequence for multidimensional indexing is deprecated; "
+               "use `arr[tuple(seq)]` instead of `arr[seq]`. In the future this will "
+               "result in a TypeError. See https://github.com/google/jax/issues/4564 "
+               "for discussion of why this type of indexing is being deprecated.")
         idx = tuple(idx)
       else:
+        msg = ("Using a non-tuple sequence for multidimensional indexing is deprecated; "
+               "use `arr[array(seq)]` instead of `arr[seq]`. In the future this will "
+               "result in a TypeError. See https://github.com/google/jax/issues/4564 "
+               "for discussion of why this type of indexing is being deprecated.")
         idx = (idx,)
+      # TODO(jakevdp): this stacklevel is appropriate for x[idx]; for ops.index_update
+      # we should use stacklevel=5; for x.at[idx].set() we should use stacklevel=6.
+      warnings.warn(msg, FutureWarning, stacklevel=4)
     else:
       idx = (idx,)
   return idx
@@ -4415,8 +4493,8 @@ def corrcoef(x, y=None, rowvar=True):
   _check_arraylike("corrcoef", x)
   c = cov(x, y, rowvar)
   if len(shape(c)) == 0:
-      # scalar - this should yield nan for values (nan/nan, inf/inf, 0/0), 1 otherwise
-      return divide(c, c)
+    # scalar - this should yield nan for values (nan/nan, inf/inf, 0/0), 1 otherwise
+    return divide(c, c)
   d = diag(c)
   stddev = sqrt(real(d))
   c = divide(c, stddev[:,None])
@@ -4424,10 +4502,10 @@ def corrcoef(x, y=None, rowvar=True):
 
   real_part = clip(real(c), -1, 1)
   if iscomplexobj(c):
-      complex_part = clip(imag(c), -1, 1)
-      c = lax.complex(real_part, complex_part)
+    complex_part = clip(imag(c), -1, 1)
+    c = lax.complex(real_part, complex_part)
   else:
-      c = real_part
+    c = real_part
   return c
 
 

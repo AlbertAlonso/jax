@@ -96,7 +96,8 @@ def categorize(prim: core.Primitive, *args, **kwargs) \
   else:
     np_dtype = None
 
-  if prim in [lax.min_p, lax.max_p]:
+  if prim in [lax.min_p, lax.max_p, lax.reduce_window_min_p,
+              lax.reduce_window_max_p]:
     if np_dtype in [np.bool_, np.int8, np.uint16, np.uint32, np.uint64,
                     np.complex64, np.complex128]:
       tf_unimpl(np_dtype)
@@ -109,16 +110,6 @@ def categorize(prim: core.Primitive, *args, **kwargs) \
   if prim is lax.nextafter_p:
     if np_dtype in [np.float16, dtypes.bfloat16]:
       tf_unimpl(np_dtype)
-
-  if prim is lax.shift_right_arithmetic_p and np_dtype in [np.uint8, np.uint16]:
-    tf_possible_incorrect(np_dtype,
-      "If first operand has higher-order bit set the result will not have it set on TPU (JAX/XLA bug)",
-      devs=["TPU"])
-
-  if prim is lax.shift_right_logical_p and np_dtype in [np.int8, np.int16]:
-    tf_possible_incorrect(np_dtype,
-      "If first operand is negative the result will be negative on TPU (JAX/XLA bug)",
-      devs=["TPU"])
 
   if prim is lax_linalg.cholesky_p:
     if np_dtype in [np.complex64, np.complex128]:
@@ -149,6 +140,15 @@ def categorize(prim: core.Primitive, *args, **kwargs) \
       # experimental_compile=True breaks for complex types.
       tf_unimpl(np_dtype, additional_msg=("this is a problem only in compiled "
                                           "mode (experimental_compile=True))"))
+
+  if prim is lax_linalg.lu_p:
+    if np_dtype == np.complex64:
+      tf_unimpl(np_dtype, devs=["TPU"])
+
+  if prim is lax_linalg.triangular_solve_p:
+    if np_dtype in [dtypes.bfloat16, np.float16]:
+      tf_unimpl(np_dtype)
+
   if prim is lax_linalg.svd_p:
     if np_dtype in [dtypes.bfloat16]:
       # TODO: SVD on TPU for bfloat16 seems to work for JAX but fails for TF
@@ -195,6 +195,10 @@ def categorize(prim: core.Primitive, *args, **kwargs) \
     if np_dtype == np.complex64:
       tf_unimpl(np_dtype, devs=["TPU"])
 
+  if prim in [lax.scatter_max_p, lax.scatter_min_p, lax.scatter_p]:
+    if np_dtype == np.bool_:
+      tf_unimpl(np_dtype)
+
   if prim is lax.sort_p:
     if np_dtype in [np.complex64, np.complex128]:
       tf_unimpl(np_dtype)
@@ -215,6 +219,26 @@ def categorize(prim: core.Primitive, *args, **kwargs) \
     if np_dtype in [np.uint32, np.uint64]:
       tf_unimpl(np_dtype)
 
+  # Testing with matmul (TODO: comment out and test without matmul)
+  if prim is lax.dot_general_p:
+    np_dtype = _to_np_dtype(args[0].dtype)
+    if np_dtype in [np.bool, np.uint8, np.uint16, np.uint32, np.uint64,
+                    np.int8]:
+      tf_unimpl(np_dtype)
+    elif np_dtype == np.int16:
+      # TODO(bchetioui): the path using 'einsum' is not compatible with int16
+      # arguments on CPU/GPU, while the one using 'matmul' is (but not in
+      # compiled mode).
+      tf_unimpl(np_dtype, additional_msg=("only cases representable as 2D "
+                                          "matrix multiplication can be "
+                                          "converted properly"),
+                devs=['CPU', 'GPU'])
+      tf_unimpl(np_dtype, devs=['TPU'])
+    elif np_dtype in [np.int16, np.int64]:
+      devs = ['CPU'] if np_dtype == np.int16 else ['CPU', 'GPU']
+      tf_unimpl(np_dtype, additional_msg=("this is a problem only in compiled "
+                                          "mode (experimental_compile=True))"),
+                devs=devs)
   if prim is lax.conv_general_dilated_p:
     batch_group_count = kwargs['batch_group_count']
     if batch_group_count != 1:
@@ -236,7 +260,7 @@ def categorize(prim: core.Primitive, *args, **kwargs) \
       # operations.
       tf_unimpl(np_dtype)
 
-  if prim is lax.lax_fft.fft_p:
+  if prim is lax.fft_p:
     if np_dtype in [np.float64, np.complex128]:
       tf_unimpl(np_dtype, additional_msg=("this is a problem only in compiled "
                                           "mode (experimental_compile=True))"))
