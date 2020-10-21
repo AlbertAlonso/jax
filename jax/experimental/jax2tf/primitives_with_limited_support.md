@@ -1,6 +1,6 @@
 # Primitives with limited support
 
-*Last generated on (YYYY-MM-DD): 2020-10-09*
+*Last generated on (YYYY-MM-DD): 2020-10-19*
 
 ## Updating the documentation
 
@@ -39,6 +39,10 @@ conversion to Tensorflow.
 | conv_general_dilated | Missing TF support | Primitive is unimplemented in TF; likely bug in the HLO -> LLVM IR lowering of XlaConv | complex128, complex64 | CPU, GPU, TPU |
 | cosh | Missing TF support | Primitive is unimplemented in TF | float16 | CPU, GPU, TPU |
 | digamma | Missing TF support | Primitive is unimplemented in TF | bfloat16 | CPU, GPU |
+| dot_general | Missing TF support | Primitive is unimplemented in TF | bool, int8, uint16, uint32, uint64, uint8 | CPU, GPU, TPU |
+| dot_general | Missing TF support | Primitive is unimplemented in TF | int16 | TPU |
+| dot_general | Missing TF support | Primitive is unimplemented in TF; only cases representable as 2D matrix multiplication can be converted properly | int16 | CPU, GPU |
+| dot_general | Missing TF support | Primitive is unimplemented in TF; this is a problem only in compiled mode (experimental_compile=True)) | int64 | CPU, GPU |
 | eig | Missing TF support | Primitive is unimplemented in TF; it is not possible to request both left and right eigenvectors for now | ALL | CPU, GPU, TPU |
 | eig | Missing TF support | Primitive is unimplemented in TF; this is a problem only in compiled mode (experimental_compile=True)) | ALL | CPU, GPU, TPU |
 | eigh | Missing TF support | Primitive is unimplemented in TF; this is a problem only in compiled mode (experimental_compile=True)) | complex128, complex64 | CPU, GPU, TPU |
@@ -48,22 +52,25 @@ conversion to Tensorflow.
 | erfc | Missing TF support | Primitive is unimplemented in TF | bfloat16 | CPU, GPU |
 | fft | Missing TF support | Primitive is unimplemented in TF; this is a problem only in compiled mode (experimental_compile=True)) | complex128, float64 | CPU, GPU, TPU |
 | lgamma | Missing TF support | Primitive is unimplemented in TF | bfloat16 | CPU, GPU |
+| lu | Missing TF support | Primitive is unimplemented in TF | complex64 | TPU |
 | max | Missing TF support | Primitive is unimplemented in TF | bool, complex128, complex64, int8, uint16, uint32, uint64 | CPU, GPU, TPU |
 | min | Missing TF support | Primitive is unimplemented in TF | bool, complex128, complex64, int8, uint16, uint32, uint64 | CPU, GPU, TPU |
 | mul | Missing TF support | Primitive is unimplemented in TF | uint32, uint64 | CPU, GPU, TPU |
 | nextafter | Missing TF support | Primitive is unimplemented in TF | bfloat16, float16 | CPU, GPU, TPU |
 | population_count | Missing TF support | Primitive is unimplemented in TF | uint32, uint64 | CPU, GPU, TPU |
 | qr | Missing TF support | Primitive is unimplemented in TF; this is a problem only in compiled mode (experimental_compile=True)) | complex128, complex64 | CPU, GPU, TPU |
+| reduce_window_max | Missing TF support | Primitive is unimplemented in TF | bool, complex128, complex64, int8, uint16, uint32, uint64 | CPU, GPU, TPU |
+| reduce_window_min | Missing TF support | Primitive is unimplemented in TF | bool, complex128, complex64, int8, uint16, uint32, uint64 | CPU, GPU, TPU |
 | reduce_window_sum | Missing TF support | Primitive is unimplemented in TF | uint16, uint32, uint64 | CPU, GPU, TPU |
 | rem | Missing TF support | Primitive is unimplemented in TF | bfloat16, float16 | CPU, GPU, TPU |
 | round | Missing TF support | Primitive is unimplemented in TF | bfloat16 | CPU, GPU |
 | rsqrt | Missing TF support | Primitive is unimplemented in TF | bfloat16 | CPU, GPU |
 | scatter-add | Missing TF support | Primitive is unimplemented in TF | complex64 | TPU |
+| scatter-max | Missing TF support | Primitive is unimplemented in TF | bool | CPU, GPU, TPU |
+| scatter-min | Missing TF support | Primitive is unimplemented in TF | bool | CPU, GPU, TPU |
 | scatter-mul | Missing TF support | Primitive is unimplemented in TF | complex64 | TPU |
 | select_and_gather_add | Missing TF support | Primitive is unimplemented in TF | float32, float64 | TPU |
 | select_and_gather_add | Missing TF support | Primitive is unimplemented in TF | float64 | CPU, GPU |
-| shift_right_arithmetic | Possible incorrect results | If first operand has higher-order bit set the result will not have it set on TPU (JAX/XLA bug) | uint16, uint8 | TPU |
-| shift_right_logical | Possible incorrect results | If first operand is negative the result will be negative on TPU (JAX/XLA bug) | int16, int8 | TPU |
 | sinh | Missing TF support | Primitive is unimplemented in TF | float16 | CPU, GPU, TPU |
 | sort | Missing TF support | Primitive is unimplemented in TF | complex128, complex64 | CPU, GPU, TPU |
 | sort | Missing TF support | Primitive is unimplemented in TF; only sorting on last dimension is supported for XlaSort | ALL | CPU, GPU, TPU |
@@ -72,16 +79,17 @@ conversion to Tensorflow.
 | sort | Missing TF support | Primitive is unimplemented in TF; stable sort not implemented for XlaSort | ALL | CPU, GPU, TPU |
 | svd | Missing TF support | Primitive is unimplemented in TF; this works on JAX because JAX uses a custom implementation | complex128, complex64 | CPU, GPU |
 | top_k | Missing TF support | Primitive is unimplemented in TF; this is a problem only in compiled mode (experimental_compile=True)) | float64, int64, uint64 | CPU, GPU, TPU |
+| triangular_solve | Missing TF support | Primitive is unimplemented in TF | bfloat16, float16 | CPU, GPU, TPU |
 
 ## Not yet implemented primitive conversions
 
 The conversion of the following JAX primitives is not yet implemented:
 
-`after_all`, `all_to_all`, `axis_index`, `create_token`, `cummax`, `cummin`, `custom_linear_solve`, `igamma_grad_a`, `infeed`, `lu`, `outfeed`, `pmax`, `pmin`, `ppermute`, `psum`, `random_gamma_grad`, `reduce`, `rng_uniform`, `triangular_solve`, `xla_pmap`
+`after_all`, `all_to_all`, `axis_index`, `create_token`, `cummax`, `cummin`, `igamma_grad_a`, `infeed`, `outfeed`, `pmax`, `pmin`, `ppermute`, `psum`, `random_gamma_grad`, `reduce`, `rng_uniform`, `xla_pmap`
 
 ## Primitive conversions with missing tests
 
 The following JAX primitives have a defined conversion but are known to be
 missing tests:
 
-`argmax`, `argmin`, `broadcast`, `clamp`, `complex`, `conj`, `custom_lin`, `device_put`, `dot_general`, `imag`, `integer_pow`, `real`, `rev`, `select_and_scatter`, `select_and_scatter_add`, `stop_gradient`, `tie_in`
+`argmin`, `broadcast`, `clamp`, `complex`, `conj`, `custom_lin`, `device_put`, `integer_pow`, `rev`, `select_and_scatter`, `select_and_scatter_add`, `tie_in`

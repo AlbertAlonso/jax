@@ -36,8 +36,14 @@ class JaxJitTest(parameterized.TestCase):
     if version <= (0, 1, 56):
       raise unittest.SkipTest("old jaxlib version")
 
-    self.assertTrue(jaxlib.jax_jit.IsFloat0(np.zeros((5, 5), dtype=jax.float0)))
-    self.assertFalse(jaxlib.jax_jit.IsFloat0(np.zeros((5, 5))))
+    self.assertTrue(
+        jaxlib.jax_jit._is_float0(np.zeros((5, 5), dtype=jax.float0)))
+    self.assertFalse(jaxlib.jax_jit._is_float0(np.zeros((5, 5))))
+
+  def test_DtypeTo32BitDtype(self):
+    if version <= (0, 1, 56):
+      raise unittest.SkipTest("old jaxlib version")
+    self.assertEqual(np.float32, jaxlib.jax_jit._DtypeTo32BitDtype(np.float64))
 
   def test_convert_scalars(self):
     jax_jit = jaxlib.jax_jit

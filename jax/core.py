@@ -393,23 +393,24 @@ class Trace:
         self.__class__.__name__, self.level, self.sublevel)
 
   def process_call(self, call_primitive, f, tracers, params):
-    raise NotImplementedError("must override to handle call-like primitives")
+    msg = (f"{type(self)} must override process_call to handle call-like "
+           "primitives")
+    raise NotImplementedError(msg)
 
   def process_map(self, call_primitive, f, tracers, params):
-    raise NotImplementedError("must override to handle map-like primitives")
+    msg = (f"{type(self)} must override process_map to handle map-like "
+           "primitives")
+    raise NotImplementedError(msg)
 
   def process_custom_jvp_call(self, primitive, fun, jvp, tracers):
-    # As a default implementation, drop the custom differentiation rule. This
-    # behavior is desirable when staging out of the JAX system, but not when
-    # there are further differentiation transformations to be applied. Override
-    # this method to allow differentiation to be performed downstream.
-    del primitive, jvp  # Unused.
-    return fun.call_wrapped(*tracers)
+    msg = (f"{type(self)} must override process_custom_jvp_call "
+           "to handle custom_jvp primitives")
+    raise NotImplementedError(msg)
 
   def process_custom_vjp_call(self, primitive, fun, fwd, bwd, tracers, out_trees):
-    # See comment in the above process_custom_jvp_call method.
-    del primitive, fwd, bwd, out_trees  # Unused.
-    return fun.call_wrapped(*tracers)
+    msg = (f"{type(self)} must override process_custom_vjp_call "
+           "to handle custom_vjp primitives")
+    raise NotImplementedError(msg)
 
 def escaped_tracer_error(detail=None):
   msg = ("Encountered an unexpected tracer. Perhaps this tracer escaped "
@@ -574,6 +575,14 @@ class EvalTrace(Trace):
   def process_call(self, primitive, f, tracers, params):
     return primitive.impl(f, *tracers, **params)
   process_map = process_call
+
+  def process_custom_jvp_call(self, primitive, fun, jvp, tracers):
+    del primitive, jvp  # Unused.
+    return fun.call_wrapped(*tracers)
+
+  def process_custom_vjp_call(self, primitive, fun, fwd, bwd, tracers, out_trees):
+    del primitive, fwd, bwd, out_trees  # Unused.
+    return fun.call_wrapped(*tracers)
 
 
 class MainTrace:
@@ -1016,9 +1025,12 @@ class ConcreteArray(ShapedArray):
     assert self.dtype != np.dtype('O'), val
 
   def __eq__(self, other):
-    return (type(self) is type(other) and self.dtype == other.dtype
-            and self.shape == other.shape and self.weak_type == other.weak_type
-            and np.all(self.val == other.val))
+    if (type(self) is type(other) and self.dtype == other.dtype
+        and self.shape == other.shape and self.weak_type == other.weak_type):
+      with eval_context():  # in case self.val is a DeviceArray
+        return (self.val == other.val).all()
+    else:
+      return False
 
   def __hash__(self):
     return id(self.val)
@@ -1201,13 +1213,43 @@ def extend_axis_env(axis_name, size: int, tag: Any):
   finally:
     thread_local_state.trace_state.axis_env.pop()
 
+
+# When a mapped function is given no axis name, we generate a name object based
+# on the id of the function object. Collisions aren't important because this
+# name can't be used in collectives, as user code never gets a ref to this
+# object. We don't want to use the function object itself because that might
+# persist references to the function object.
+# TODO(mattjj): revisit this unique axis name strategy
+class _TempAxisName:
+
+  def __init__(self, obj):
+    self.id = id(obj)
+
+  def __repr__(self):
+    return f'<axis {hex(self.id)}>'
+
+  def __hash__(self):
+    return hash(self.id)
+
+  def __eq__(self, other):
+    return type(other) is _TempAxisName and self.id == other.id
+
+
 def axis_frame(axis_name):
   frames = thread_local_state.trace_state.axis_env
   for frame in reversed(frames):
     if frame.name == axis_name:
       return frame
 
-  raise NameError("unbound axis name: {}".format(axis_name))
+  named_axis = [
+      frame.name
+      for frame in reversed(frames)
+      if not isinstance(frame.name, _TempAxisName)
+  ]
+  raise NameError(
+      f'unbound axis name: {axis_name}. The following axis names (e.g. defined '
+      'by pmap) are available to collectives operations:'
+      f'{named_axis}')
 
 
 # ------------------- Jaxpr checking -------------------
@@ -1428,7 +1470,7 @@ def pp_jaxpr_eqn_range(jaxpr: Jaxpr, lo: int, hi: int,
   eqns = jaxpr.eqns[lo:hi]
   pps = []
   if len(eqns) == 0 and len(jaxpr.eqns) != 0:
-      pps.append(pp('...'))
+    pps.append(pp('...'))
   else:
     if lo != 0:
       pps.append(pp('...'))

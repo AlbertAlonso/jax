@@ -132,6 +132,33 @@ class CPPJitTest(jtu.JaxTestCase):
     assert f2(two, five, three, True, True) == 253
     assert len(side) == 3
 
+  def test_static_args_equality(self):
+    if version < (0, 1, 57):
+      raise unittest.SkipTest("this test requires a newest jaxlib")
+
+    class A():
+
+      def __hash__(self):
+        return 1
+
+      def __eq__(self, other):
+        return isinstance(other, A)
+
+    side = []
+    def f(x, static_arg):
+      del static_arg
+      side.append(None)
+      return x * 100
+
+    f1 = self.jit(f, static_argnums=(1,))
+
+    self.assertEqual(f1(1, A()), 100)
+    self.assertLen(side, 1)
+    self.assertEqual(f1(1, A()), 100)
+    self.assertLen(side, 1)
+    if self.jit == jax.api._cpp_jit:
+      self.assertEqual(f1._cpp_jitted_f._cache_size(), 1)
+
   @parameterized.parameters([
       (1, 2, 3),
       (
@@ -336,28 +363,6 @@ class CPPJitTest(jtu.JaxTestCase):
     for x, y in zip(xs, ys):
       self.assertAllClose(x * 2 - 3., y)
 
-
-class PythonJitTest(CPPJitTest):
-
-  @property
-  def jit(self):
-    return jax.api._python_jit
-
-  def test_jit_reference_dropping(self):
-    x = jnp.ones(10)
-    f = (lambda x: lambda: x)(x)  # reference to x in f's closure
-    g = self.jit(f)
-    x = weakref.ref(x)      # no more strong ref to x in this scope
-    assert x() is not None  # x is still around
-    f()                     # f runs
-    g()                     # g runs
-    g()                     # g runs a second time
-    del f                   # delete the raw callable
-    assert x() is not None  # x is still around
-    g()                     # g still runs
-    del g                   # no more references to x
-    assert x() is None      # x is gone
-
   def test_trivial_computations(self):
     x = jnp.array([1, 2, 3])
     y = self.jit(lambda x: x)(x)
@@ -378,7 +383,7 @@ class PythonJitTest(CPPJitTest):
 
     self.assertRaisesRegex(
         TypeError, ".* 'foo' of type <.*'str'> is not a valid JAX type",
-        lambda: jit(f)("foo"))
+        lambda: self.jit(f)("foo"))
 
   def test_jit_on_all_devices(self):
     # Verifies we can run the same computation on every device present, even
@@ -398,6 +403,28 @@ class PythonJitTest(CPPJitTest):
     #   jit_fun(a)
 
     jit_fun(a)  # doesn't crash
+
+  def test_jit_reference_dropping(self):
+    x = jnp.ones(10)
+    f = (lambda x: lambda: x)(x)  # reference to x in f's closure
+    g = self.jit(f)
+    x = weakref.ref(x)      # no more strong ref to x in this scope
+    assert x() is not None  # x is still around
+    f()                     # f runs
+    g()                     # g runs
+    g()                     # g runs a second time
+    del f                   # delete the raw callable
+    assert x() is not None  # x is still around
+    g()                     # g still runs
+    del g                   # no more references to x
+    assert x() is None      # x is gone
+
+
+class PythonJitTest(CPPJitTest):
+
+  @property
+  def jit(self):
+    return jax.api._python_jit
 
 
 class APITest(jtu.JaxTestCase):
@@ -1106,16 +1133,16 @@ class APITest(jtu.JaxTestCase):
   def test_issue_871(self):
     T = jnp.array([[1., 2.], [3., 4.], [5., 6.]])
     x = jnp.array([1, 2, 3])
+    msg = ("linearized function called on tangent values inconsistent with "
+           "the original primal values")
 
     y, f_jvp = api.linearize(jnp.sum, x)
-    jtu.check_raises(lambda: f_jvp(T), ValueError,
-                     ("linearized function called on tangent values "
-                      "inconsistent with the original primal values."))
+    with self.assertRaisesRegex(ValueError, msg):
+      f_jvp(T)
 
     y, f_jvp = api.linearize(api.jit(jnp.sum), x)
-    jtu.check_raises(lambda: f_jvp(T), ValueError,
-                     ("linearized function called on tangent values "
-                      "inconsistent with the original primal values."))
+    with self.assertRaisesRegex(ValueError, msg):
+      f_jvp(T)
 
   def test_partial_eval_lower(self):
     # this is a simplified model of a bug that arose when we first used @jit in
@@ -1939,6 +1966,38 @@ class APITest(jtu.JaxTestCase):
       xla.device_put = orig_device_put
     self.assertEqual(count, 0)
 
+  def test_join_concrete_arrays_with_omnistaging(self):
+    # https://github.com/google/jax/issues/4622
+    if not config.omnistaging_enabled:
+      raise unittest.SkipTest("test is omnistaging-specific")
+
+    x = jnp.array([1., 2., 3.])
+    y = jnp.array([1., 2., 4.])
+
+    @jit
+    def f():
+      core.lattice_join(core.ConcreteArray(x), core.ConcreteArray(y))
+
+    f()  # doesn't crash
+
+  def test_linearize_aval_error(self):
+    # https://github.com/google/jax/issues/4622
+    f = lambda x: x
+
+    # these should not error
+    _, f_jvp = api.linearize(f, 1.)
+    f_jvp(1.)
+    _, f_jvp = api.linearize(f, np.ones(2, np.int32))
+    f_jvp(np.zeros(2, float0))
+
+    # these should error
+    _, f_jvp = api.linearize(f, 1.)
+    with self.assertRaisesRegex(ValueError, "tangent values inconsistent"):
+      f_jvp(1)
+    _, f_jvp = api.linearize(f, np.ones(2, np.int32))
+    with self.assertRaisesRegex(ValueError, "tangent values inconsistent"):
+      f_jvp(np.ones(2, np.int32))
+
 
 class RematTest(jtu.JaxTestCase):
 
@@ -2322,6 +2381,23 @@ class RematTest(jtu.JaxTestCase):
     # 2 calls made while transposing g, no reevaluation for transposition of f
     with assertEvals(2):
       vjp(v)
+
+  def test_escaped_tracer_remat(self):
+    # b/169779185
+    if not config.omnistaging_enabled:
+      raise unittest.SkipTest("test only works with omnistaging")
+
+    def f():
+      seq = [jnp.zeros([])]
+      def g():
+        seq[0] += 1  # this is line 7 btw
+        return seq[0]
+
+      api.remat(g)()
+      api.remat(g)()
+
+    with self.assertRaisesRegex(core.UnexpectedTracerError, "global state"):
+      api.jit(f)()
 
 
 class JaxprTest(jtu.JaxTestCase):
@@ -2766,7 +2842,27 @@ class CustomJVPTest(jtu.JaxTestCase):
     expected = 2.
     self.assertAllClose(ans, expected, check_dtypes=False)
 
+    ans = api.grad(api.jit(foo))(3.)
+    expected = 2.
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.jit(api.grad(foo))(3.)
+    expected = 2.
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
     ans = api.grad(api.grad(foo))(3.)
+    expected = 0.
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(api.grad(api.jit(foo)))(3.)
+    expected = 0.
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(api.jit(api.grad(foo)))(3.)
+    expected = 0.
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.jit(api.grad(api.grad(foo)))(3.)
     expected = 0.
     self.assertAllClose(ans, expected, check_dtypes=False)
 
@@ -2789,11 +2885,38 @@ class CustomJVPTest(jtu.JaxTestCase):
     expected = 3. * jnp.ones(3)
     self.assertAllClose(ans, expected, check_dtypes=False)
 
+    ans = api.vmap(api.jit(foo))(jnp.ones(3))
+    expected = 3. * jnp.ones(3)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.jit(api.vmap(foo))(jnp.ones(3))
+    expected = 3. * jnp.ones(3)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
     ans = api.grad(lambda x: api.vmap(foo)(x).sum())(jnp.ones(3))
     expected = 2. * jnp.ones(3)
     self.assertAllClose(ans, expected, check_dtypes=False)
 
+    ans = api.grad(lambda x: api.vmap(api.jit(foo))(x).sum())(jnp.ones(3))
+    expected = 2. * jnp.ones(3)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(lambda x: api.jit(api.vmap(foo))(x).sum())(jnp.ones(3))
+    expected = 2. * jnp.ones(3)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(api.jit(lambda x: api.vmap(foo)(x).sum()))(jnp.ones(3))
+    expected = 2. * jnp.ones(3)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.jit(api.grad(lambda x: api.vmap(foo)(x).sum()))(jnp.ones(3))
+    expected = 2. * jnp.ones(3)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
   def test_closed_over_tracers_error_message(self):
+    if not config.omnistaging_enabled:
+      raise unittest.SkipTest("test only works with omnistaging")
+
     def f(x):
       @api.custom_jvp
       def g(y):
@@ -2803,10 +2926,8 @@ class CustomJVPTest(jtu.JaxTestCase):
       g.defjvp(g_jvp)
       return g(1.)
 
-    self.assertRaises(
-        core.UnexpectedTracerError, lambda: api.jvp(f, (3.,), (1.,)))
-    self.assertRaises(
-        core.UnexpectedTracerError, lambda: api.grad(f)(3.))
+    self.assertRaises(ad.CustomJVPException, lambda: api.jvp(f, (3.,), (1.,)))
+    self.assertRaises(ad.CustomJVPException, lambda: api.grad(f)(3.))
 
   def test_nondiff_arg(self):
     @partial(api.custom_jvp, nondiff_argnums=(0,))
@@ -2841,6 +2962,25 @@ class CustomJVPTest(jtu.JaxTestCase):
     ans = api.jvp(lambda y: g(2., y), (3.,), (1.,))
     expected = (6., 5.)
     self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_nondiff_arg_hiding_jvp_tracer(self):
+    if not config.omnistaging_enabled:
+      raise unittest.SkipTest("test only works with omnistaging")
+
+    def f(x):
+      @partial(api.custom_jvp, nondiff_argnums=(0,))
+      def g(h, x):
+        return h(x)
+      @g.defjvp
+      def g_jvp(h, primals, tangents):
+        x, = primals
+        t, = tangents
+        return g(h, x), 2. * t
+      h = lambda y: x + y  # capture x
+      return g(h, x)
+
+    with self.assertRaisesRegex(ad.CustomJVPException, "Detected differentiation"):
+      api.jvp(f, (2.,), (1.,))
 
   def test_vmap_axes(self):
     raise unittest.SkipTest("TODO")  # TODO(mattjj): write test
@@ -3096,6 +3236,77 @@ class CustomJVPTest(jtu.JaxTestCase):
     for ans in results:
       self.assertAllClose(ans, expected)
 
+  def test_nondiff_argnums_vmap_tracer(self):
+    # https://github.com/google/jax/issues/3964
+    if not config.omnistaging_enabled:
+      raise unittest.SkipTest("test only works with omnistaging")
+
+    @partial(jax.custom_jvp, nondiff_argnums=(0, 2))
+    def sample(shape, param, seed):
+      return jax.random.uniform(key=seed, shape=shape, minval=param)
+
+    @sample.defjvp
+    def sample_jvp(shape, seed, primals, tangents):
+      param, = primals
+      dparam, = tangents
+      dparam = jnp.broadcast_to(dparam, shape)
+      samples = sample(shape, param, seed)
+      return samples, samples * dparam  # dummy jvp for proof of concept
+
+    # check these don't crash
+    jax.vmap(lambda seed: sample((2,3), 1., seed))(
+        jax.random.split(jax.random.PRNGKey(1), 10))
+    jax.jvp(lambda x: sample((2, 3), x, jax.random.PRNGKey(1)),
+            (1.,), (1.,))
+
+  def test_fun_with_nested_calls_2(self):
+    if not config.omnistaging_enabled:
+      raise unittest.SkipTest("test only works with omnistaging")
+
+    def call(f, *args):
+      f = api.custom_jvp(f)
+      f.defjvp(lambda primals, tangents: (f(*primals), sum(tangents)))
+      return f(*args)
+
+    def fun_with_nested_calls_2(x):
+      def bar(y):
+        def baz(w):
+          q = call(lambda x: y, x)
+          q = q + call(lambda: y)
+          q = q + call(lambda y: w + y, y)
+          q = call(lambda w: call(jnp.sin, x) * y, 1.0) + q
+          return q
+        return api.jit(baz)(x)
+      return call(bar, x)
+
+    # test these don't crash
+    self.assertAllClose(api.jit(fun_with_nested_calls_2)(3.),
+                        fun_with_nested_calls_2(3.))
+    api.vmap(fun_with_nested_calls_2)(jnp.arange(3.))
+
+  def test_closure_with_vmap(self):
+    if not config.omnistaging_enabled:
+      raise unittest.SkipTest("test only works with omnistaging")
+
+    # https://github.com/google/jax/issues/3822
+    alpha = np.float32(2.)
+
+    def sample(seed):
+      @api.custom_jvp
+      def f(alpha):
+        return jax.random.gamma(seed, alpha, shape=[])
+
+      @f.defjvp
+      def f_jvp(primal, tangent):
+        alpha = primal
+        dalpha = tangent
+        sample = f(alpha)
+        partial_alpha = lax.random_gamma_grad(alpha, sample)
+        return sample, partial_alpha * dalpha
+      return f(alpha)
+
+    api.vmap(sample)(jax.random.split(jax.random.PRNGKey(1), 3))  # don't crash
+
   def test_float0(self):
     @api.custom_jvp
     def f(x, y):
@@ -3129,6 +3340,92 @@ class CustomJVPTest(jtu.JaxTestCase):
     expected_tangents = (2., np.zeros((), float0))
     self.assertArraysEqual(api.jvp(foo, primals, tangents),
                            (primals, expected_tangents))
+
+  def test_remat(self):
+    @api.custom_jvp
+    def f(x):
+      return jnp.sin(x)
+    def f_jvp(primals, tangents):
+      x, = primals
+      g, = tangents
+      return f(x), 2 * jnp.cos(x) * g
+    f.defjvp(f_jvp)
+
+    @api.remat
+    def g(x):
+      return f(f(x))
+
+    ans = g(2.)
+    expected = np.sin(np.sin(2.))
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(g)(2.)
+    expected = 4. * api.grad(lambda x: jnp.sin(jnp.sin(x)))(2.)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_remat_higher_order(self):
+    @api.custom_jvp
+    def f(x):
+      return jnp.sin(x)
+    def f_jvp(primals, tangents):
+      x, = primals
+      g, = tangents
+      return f(x), 2 * jnp.cos(x) * g
+    f.defjvp(f_jvp)
+
+    def g(x):
+      return f(f(x))
+
+    ans = api.grad(api.grad(api.remat(g)))(2.)
+    expected = api.grad(api.grad(g))(2.)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(api.remat(api.grad(g)))(2.)
+    expected = api.grad(api.grad(g))(2.)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(api.grad(api.grad(api.remat(g))))(2.)
+    expected = api.grad(api.grad(api.grad(g)))(2.)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_initial_style_vmap_2(self):
+    # This is like test_initial_style_vmap except the primal function closes
+    # over an array constant.
+    y = jnp.array([1., 2., 3.])
+
+    @api.custom_jvp
+    def f(x):
+      assert jnp.ndim(x) == 0
+      return 3 * x * jnp.sum(y)
+    def f_jvp(primals, tangents):
+      x, = primals
+      g, = tangents
+      return f(x), 2 * g
+    f.defjvp(f_jvp)
+
+    def foo(x):
+      out, _  = lax.scan(lambda c, _: (f(c), None), x, None, length=1)
+      return out
+
+    ans = api.grad(lambda x: api.vmap(foo)(x).sum())(jnp.ones(3))
+    expected = 2. * jnp.ones(3)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(lambda x: api.vmap(api.jit(foo))(x).sum())(jnp.ones(3))
+    expected = 2. * jnp.ones(3)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(lambda x: api.jit(api.vmap(foo))(x).sum())(jnp.ones(3))
+    expected = 2. * jnp.ones(3)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(api.jit(lambda x: api.vmap(foo)(x).sum()))(jnp.ones(3))
+    expected = 2. * jnp.ones(3)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.jit(api.grad(lambda x: api.vmap(foo)(x).sum()))(jnp.ones(3))
+    expected = 2. * jnp.ones(3)
+    self.assertAllClose(ans, expected, check_dtypes=False)
 
 
 class CustomVJPTest(jtu.JaxTestCase):
@@ -3368,6 +3665,12 @@ class CustomVJPTest(jtu.JaxTestCase):
     self.assertAllClose(ans, expected, check_dtypes=False)
 
   def test_nondiff_arg_tracer(self):
+    # This test is now skipped because we decided not to support this behavior
+    # anymore (namely, nondiff args can't be tracers), but
+    # test_closed_over_tracer is a replacement test for analogous behavior that
+    # we do support
+    raise unittest.SkipTest("removed support for tracers in nondiff args")
+
     @partial(api.custom_vjp, nondiff_argnums=(0,))
     def f(x, y):
       return x * y
@@ -3388,6 +3691,56 @@ class CustomVJPTest(jtu.JaxTestCase):
     ans = api.grad(g, 1)(2., 3.)
     expected = jnp.cos(3.)
     self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_closed_over_tracer(self):
+    # This test is similar to test_nondiff_arg_tracer except it uses lexical
+    # closure rather than the nondiff_argnums mechanism. We decided to disallow
+    # tracers in nondiff_argnums to greatly simplify bookkeeping while still
+    # supporting the cases for which it is necessary.
+    def outer(x):
+      @api.custom_vjp
+      def f(y):
+        return x * y
+      def f_fwd(y):
+        return f(y), jnp.cos(y)
+      def f_rev(cos_y, g):
+        return (cos_y * g,)
+      f.defvjp(f_fwd, f_rev)
+      return f
+
+    @jit
+    def g(x, y):
+      return outer(x)(y)
+
+    ans = g(2, 3.)
+    expected = 6.
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(g, 1)(2., 3.)
+    expected = jnp.cos(3.)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_nondiff_arg_tracer_error(self):
+    # This is similar to the old (now skipped) test_nondiff_arg_tracer, except
+    # we're testing for the error message that that usage pattern now raises.
+
+    @partial(api.custom_vjp, nondiff_argnums=(0,))
+    def f(x, y):
+      return x * y
+    def f_fwd(x, y):
+      return f(x, y), jnp.cos(y)
+    def f_rev(x, cos_y, g):
+      return (cos_y * g,)
+    f.defvjp(f_fwd, f_rev)
+
+    @jit
+    def g(x, y):
+      return f(x, y)
+
+    with self.assertRaisesRegex(core.UnexpectedTracerError, "custom_vjp"):
+      _ = g(2, 3.)
+    with self.assertRaisesRegex(core.UnexpectedTracerError, "custom_vjp"):
+      _ = api.grad(g, 1)(2., 3.)
 
   def test_vmap_axes(self):
     raise unittest.SkipTest("TODO")  # TODO(mattjj): write test
@@ -3418,7 +3771,7 @@ class CustomVJPTest(jtu.JaxTestCase):
       return x, None
 
     def foo_bwd(_, g):
-      return g
+      return (g, g)
 
     f.defvjp(foo_fwd, foo_bwd)
 
@@ -3431,7 +3784,7 @@ class CustomVJPTest(jtu.JaxTestCase):
             "and in particular must produce a tuple of length equal to the "
             "number of arguments to the primal function, but got VJP output "
             "structure {} for primal input structure {}.".format(
-                tree_util.tree_structure(1),
+                tree_util.tree_structure((1, 1)),
                 tree_util.tree_structure((1,)))
         ),
         lambda: api.grad(f)(2.))
@@ -3455,6 +3808,11 @@ class CustomVJPTest(jtu.JaxTestCase):
     jax.grad(g, argnums=(1,))(F(2.0), 0.)  # doesn't crash
 
   def test_nondiff_argnums_stop_gradient(self):
+    # This test is now skipped because we decided not to support this behavior
+    # anymore (namely, nondiff args can't be tracers), but test_clip_gradient is
+    # a replacement showing behavior we do support.
+    raise unittest.SkipTest("removed support for tracers in nondiff args")
+
     # https://github.com/google/jax/issues/2784
     @partial(api.custom_vjp, nondiff_argnums=(0, 1))
     def _clip_gradient(lo, hi, x):
@@ -3475,6 +3833,29 @@ class CustomVJPTest(jtu.JaxTestCase):
       return _clip_gradient(lo, hi, x)
 
     jax.grad(clip_gradient)(1.)  # doesn't crash
+
+  def test_clip_gradient(self):
+    # https://github.com/google/jax/issues/2784
+    @api.custom_vjp
+    def _clip_gradient(lo, hi, x):
+      return x  # identity function when not differentiating
+
+    def clip_gradient_fwd(lo, hi, x):
+      return x, (lo, hi,)
+
+    def clip_gradient_bwd(res, g):
+      lo, hi = res
+      return (None, None, jnp.clip(g, lo, hi),)
+
+    _clip_gradient.defvjp(clip_gradient_fwd, clip_gradient_bwd)
+
+    def clip_gradient(x):
+      lo = -0.1
+      hi = x + 0.1
+      return _clip_gradient(lo, hi, x)
+
+    g = jax.grad(clip_gradient)(0.1)  # doesn't crash
+    self.assertAllClose(g, jnp.array(0.2))
 
   def test_nestable_vjp(self):
     # Verify that https://github.com/google/jax/issues/3667 is resolved.
@@ -3508,6 +3889,121 @@ class CustomVJPTest(jtu.JaxTestCase):
       return g_vjp
     y, = z(1.0)(3.0)
     self.assertAllClose(y, jnp.array(6.0))
+
+  def test_initial_style_vmap_2(self):
+    # https://github.com/google/jax/issues/4173
+    x = jnp.ones((10, 3))
+
+    # Create the custom function
+    @api.custom_vjp
+    def custom_fun(x):
+        return x.sum()
+    def forward(x):
+        return x.sum(), (jnp.ones_like(x),)
+    def backward(res, g):
+        return g*res[0],
+    custom_fun.defvjp(forward, backward)
+
+    def train_fun(x):
+        def summed_fun(x):
+            return api.vmap(custom_fun)(x).sum()
+        return api.grad(summed_fun)(x)
+
+    def scan_body(carry, inputs):
+        x = carry
+        return carry, train_fun(x)
+
+    scan_range = jnp.arange(4)
+    lax.scan(scan_body, x, scan_range)  # don't crash
+
+  def test_initial_style_vmap_3(self):
+    # This is like test_initial_style_vmap except the primal function closes
+    # over an array constant.
+    y = jnp.array([1., 2., 3.])
+
+    @api.custom_vjp
+    def f(x):
+      assert jnp.ndim(x) == 0
+      return 3 * x * jnp.sum(y)
+    def f_fwd(x):
+      return f(x), jnp.cos(x)
+    def f_rev(cos_x, g):
+      return (2 * cos_x * g,)
+    f.defvjp(f_fwd, f_rev)
+
+    def foo(x):
+      out, _  = lax.scan(lambda c, _: (f(c), None), x, None, length=1)
+      return out
+
+    ans = api.vmap(foo)(jnp.arange(3.))
+    expected = 3. * jnp.arange(3.) * 6
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(lambda x: api.vmap(foo)(x).sum())(jnp.arange(3.))
+    expected = 2. * jnp.cos(jnp.arange(3.))
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_bwd_closes_over_tracer(self):
+    def f(y):
+      @jax.custom_vjp
+      def f(x):
+        return 2. * jnp.sin(x)
+
+      def fwd(x):
+        return f(x), ()
+
+      def bwd(_, g):
+        return (2. * jnp.cos(y) * g,)  # capture!
+
+      f.defvjp(fwd, bwd)
+
+      return jax.grad(f)(1.)
+
+    ans = jax.jit(f)(2.)
+    self.assertAllClose(ans, 2. * jnp.cos(2.))
+
+    ans = jax.vmap(f)(jnp.arange(3.))
+    self.assertAllClose(ans, 2. * jnp.cos(jnp.arange(3.)))
+
+    ans = jax.jit(jax.vmap(f))(jnp.arange(3.))
+    self.assertAllClose(ans, 2. * jnp.cos(jnp.arange(3.)))
+
+    ans = jax.vmap(jax.jit(f))(jnp.arange(3.))
+    self.assertAllClose(ans, 2. * jnp.cos(jnp.arange(3.)))
+
+    ans = jax.grad(f)(4.)
+    self.assertAllClose(ans, -2. * jnp.sin(4.))
+
+  def test_fwd_closes_over_tracer(self):
+    def f(y):
+      @jax.custom_vjp
+      def f(x):
+        return 2. * jnp.sin(x)
+
+      def fwd(x):
+        return f(x), y
+
+      def bwd(y, g):
+        return (2. * jnp.cos(y) * g,)  # capture!
+
+      f.defvjp(fwd, bwd)
+
+      return jax.grad(f)(1.)
+
+    ans = jax.jit(f)(2.)
+    self.assertAllClose(ans, 2. * jnp.cos(2.))
+
+    ans = jax.vmap(f)(jnp.arange(3.))
+    self.assertAllClose(ans, 2. * jnp.cos(jnp.arange(3.)))
+
+    ans = jax.jit(jax.vmap(f))(jnp.arange(3.))
+    self.assertAllClose(ans, 2. * jnp.cos(jnp.arange(3.)))
+
+    ans = jax.vmap(jax.jit(f))(jnp.arange(3.))
+    self.assertAllClose(ans, 2. * jnp.cos(jnp.arange(3.)))
+
+    ans = jax.grad(f)(4.)
+    self.assertAllClose(ans, -2. * jnp.sin(4.))
 
   def test_float0(self):
     @api.custom_vjp
@@ -3543,6 +4039,134 @@ class CustomVJPTest(jtu.JaxTestCase):
     y = 3
     self.assertEqual(api.grad(foo, allow_int=True, argnums=(0, 1))(x, y),
                      (2., np.zeros(shape=(), dtype=float0)))
+
+  def test_remat(self):
+    @api.custom_vjp
+    def f(x):
+      return jnp.sin(x)
+    def f_fwd(x):
+      return f(x), jnp.cos(x)
+    def f_rev(cos_x, g):
+      return (2 * cos_x * g,)
+    f.defvjp(f_fwd, f_rev)
+
+    @api.remat
+    def g(x):
+      return f(f(x))
+
+    ans = g(2.)
+    expected = np.sin(np.sin(2.))
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(g)(2.)
+    expected = 4. * api.grad(lambda x: jnp.sin(jnp.sin(x)))(2.)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_remat_higher_order(self):
+    @api.custom_vjp
+    def f(x):
+      return jnp.sin(x)
+    def f_fwd(x):
+      return f(x), jnp.cos(x)
+    def f_rev(cos_x, g):
+      return (2 * cos_x * g,)
+    f.defvjp(f_fwd, f_rev)
+
+    def g(x):
+      return f(f(x))
+
+    ans = api.grad(api.grad(api.remat(g)))(2.)
+    expected = api.grad(api.grad(g))(2.)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(api.remat(api.grad(g)))(2.)
+    expected = api.grad(api.grad(g))(2.)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+    ans = api.grad(api.grad(api.grad(api.remat(g))))(2.)
+    expected = api.grad(api.grad(api.grad(g)))(2.)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_bwd_nones(self):
+    @api.custom_vjp
+    def f(x, y):
+      return x * jnp.sin(y)
+    def f_fwd(x, y):
+      return f(x, y), jnp.cos(y)
+    def f_rev(cos, g):
+      return (None, 2 * cos * g)
+    f.defvjp(f_fwd, f_rev)
+
+    ans = api.grad(lambda x: f(x, x))(3.)
+    expected = 2 * jnp.cos(3.)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_bwd_nones_vmap(self):
+    @api.custom_vjp
+    def f(x, y):
+      return x * jnp.sin(y)
+    def f_fwd(x, y):
+      return f(x, y), jnp.cos(y)
+    def f_rev(cos, g):
+      return (None, 2 * cos * g)
+    f.defvjp(f_fwd, f_rev)
+
+    ans = api.grad(lambda x: api.vmap(f)(x, x).sum())(jnp.arange(3.))
+    expected = 2 * jnp.cos(jnp.arange(3.))
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_bwd_nones_pytree(self):
+    @api.custom_vjp
+    def f(xs, y):
+      x1, x2 = xs
+      return x1 * x2 * jnp.sin(y)
+    def f_fwd(xs, y):
+      return f(xs, y), jnp.cos(y)
+    def f_rev(cos, g):
+      return (None, 2 * cos * g)
+    f.defvjp(f_fwd, f_rev)
+
+    ans = api.grad(lambda x: f((x, x), x))(3.)
+    expected = 2 * jnp.cos(3.)
+    self.assertAllClose(ans, expected, check_dtypes=False)
+
+  def test_custom_vjp_closure_4521(self):
+    # https://github.com/google/jax/issues/4521
+    @api.custom_vjp
+    def g(x, y):
+      return None
+    def g_fwd(x, y):
+      return None, y
+    def g_bwd(residuals, z_bar):
+      assert False
+
+    g.defvjp(g_fwd, g_bwd)
+
+    def f(xs, y):
+      v_g = api.vmap(g, in_axes=(0, None), out_axes=None)
+      v_g(xs, y)
+
+    def scan_body(xs, _):
+      y = jnp.zeros(1)
+      _, vjp_f = api.vjp(f, xs, y)
+      vjp_f(None)
+      return xs, None
+
+    lax.scan(scan_body, jnp.ones(5), None, 100)  # doesn't crash
+
+  def test_float0_bwd_none(self):
+    @api.custom_vjp
+    def f(i, x):
+      return jnp.sin(x)
+    def f_fwd(i, x):
+      return f(i, x), jnp.cos(x)
+    def f_rev(cos_x, g):
+      return (None, 2 * cos_x * g)
+    f.defvjp(f_fwd, f_rev)
+
+    ans = api.grad(f, 1)(jnp.array([1, 2]), 3.)  # doesn't crash
+    expected = 2 * jnp.cos(3.)
+    self.assertAllClose(ans, expected, check_dtypes=False)
 
 
 class InvertibleADTest(jtu.JaxTestCase):
@@ -3750,35 +4374,6 @@ class DeprecatedCustomTransformsTest(jtu.JaxTestCase):
     self.assertAllClose(grad_ans, 3. * 4. + np.cos(np.sin(3. * 4)),
                         check_dtypes=False)
 
-  # TODO
-  # def test_defjvp_closure_error(self):
-  #   def foo(x):
-  #     @api.custom_transforms
-  #     def bar(y):
-  #       return x * y
-
-  #     api.defjvp(bar, lambda y_dot, ans, y: x * y)
-  #     return bar(x)
-  #   jtu.check_raises(
-  #       lambda: api.jvp(foo, (1.,), (1.,)), ValueError,
-  #       "Detected differentiation with respect to closed-over values with "
-  #       "custom JVP rule, which isn't supported.")
-
-  # TODO
-  # def test_defvjp_closure_error(self):
-  #   def foo(x):
-  #     @api.custom_transforms
-  #     def bar(y):
-  #       return x * y
-
-  #     api.defvjp(bar, lambda g, ans, y: x * y)
-  #     return bar(x)
-  #   jtu.check_raises(
-  #       lambda: grad(foo)(1.,), ValueError,
-  #       "Detected differentiation w.r.t. variables from outside "
-  #       "the scope of <jax.custom_transforms function bar>, but defvjp and "
-  #       "defvjp_all only support differentiation w.r.t. positional arguments.")
-
   def test_custom_transforms_eval_with_pytrees(self):
     @api.custom_transforms
     def f(x):
@@ -3888,8 +4483,6 @@ class DeprecatedCustomTransformsTest(jtu.JaxTestCase):
     print(gf(a, b))  # doesn't crash
 
 class BufferDonationTest(jtu.JaxTestCase):
-
-  # === pmap ===
 
   @jtu.skip_on_devices("cpu")  # In/out aliasing not supported on CPU.
   def test_pmap_donate_argnums_invalidates_input(self):

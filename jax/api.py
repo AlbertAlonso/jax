@@ -50,6 +50,7 @@ from .tree_util import (tree_map, tree_flatten, tree_unflatten, tree_structure,
 from .util import (unzip2, curry, partial, safe_map, safe_zip, prod, split_list,
                    extend_name_stack, wrap_name, cache)
 from .lib import jax_jit
+from .lib import version
 from .lib import xla_bridge as xb
 from .lib import xla_client as xc
 # Unused imports to be exported
@@ -86,10 +87,11 @@ zip = safe_zip
 FLAGS = flags.FLAGS
 flags.DEFINE_bool("jax_disable_jit", bool_env("JAX_DISABLE_JIT", False),
                   "Disable JIT compilation and just call original Python.")
-flags.DEFINE_bool("experimental_cpp_jit", bool_env("JAX_CPP_JIT", False),
-                  "A temporary flag enabling the C++ jax.jit fast path."
-                  "Set this to `False` only if it crashes otherwise and report "
-                  "the error to the jax-team.")
+flags.DEFINE_bool(
+    "experimental_cpp_jit", bool_env("JAX_CPP_JIT", False),
+    "A temporary flag enabling the C++ jax.jit fast path."
+    "Set this to `False` only if it crashes otherwise and report "
+    "the error to the jax-team.")
 
 float0 = dtypes.float0
 
@@ -220,52 +222,17 @@ def _python_jit(
   return f_jitted
 
 
-def _cache_for_cpp_jit(call):
-  """Cache decorator for `_cpp_jit`.
-
-  This is similar to `cache` from `linear_util.py` but not for wrapped functons.
-
-  Args:
-    call: a function that takes a plain function as a first argument.
-
-  Returns:
-     The memoized `call` function.
-  """
-  fun_caches = weakref.WeakKeyDictionary()
-
-  def memoized_fun(fun: Callable,
-                   static_argnums: Union[int, Iterable[int]] = (),
-                   device=None,
-                   backend=None,
-                   donate_argnums: Union[int, Iterable[int]] = ()):
-    _check_callable(fun)
-    # We need tuples if we want them to be hashable.
-    static_argnums = _ensure_tuple(static_argnums)
-    donate_argnums = _ensure_tuple(donate_argnums)
-    cache_for_f = fun_caches.setdefault(fun, {})
-    key = (static_argnums, device, backend, donate_argnums)
-    result = cache_for_f.get(key, None)
-    if result is None:
-      result = call(fun, static_argnums, device, backend, donate_argnums)
-      cache_for_f[key] = result
-    return result
-
-  memoized_fun.cache_clear = fun_caches.clear
-  return memoized_fun
-
-
 class _BackendAndDeviceInfo(NamedTuple):
   default_device: xc.Device
   committed_to_device: bool
 
 
-@_cache_for_cpp_jit
 def _cpp_jit(
     fun: Callable,
-    static_argnums: Iterable[int] = (),
+    static_argnums: Union[int, Iterable[int]] = (),
     device=None,
     backend: Optional[str] = None,
-    donate_argnums: Iterable[int] = ()) -> Callable:
+    donate_argnums: Union[int, Iterable[int]] = ()) -> Callable:
   """An implementation of `jit` that tries to do as much as possible in C++.
 
   The goal of this function is to speed up the time it takes to process the
@@ -275,8 +242,9 @@ def _cpp_jit(
   the C++ code will fallback to `_python_jit` when it faces some unsupported
   feature.
   """
-  # `_check_callable(fun)` and the normalization of the argnums are in
-  # `_cache_for_cpp_jit`.
+  _check_callable(fun)
+  static_argnums = _ensure_tuple(static_argnums)
+  donate_argnums = _ensure_tuple(donate_argnums)
   donate_argnums = rebase_donate_argnums(donate_argnums, static_argnums)
 
   if device is not None and backend is not None:
@@ -328,8 +296,9 @@ def _cpp_jit(
         # Not supported: ShardedDeviceArray, DeviceConstant.
         all(type(x) is xla.DeviceArray for x in out_flat) and
         # TODO(mattjj): Add support for lazy-expression.
+        # If the input is a DeviceArray, then it should have a trivial LazyExpr.
         all(
-            type(x) is xla.DeviceArray and xla.lazy.is_trivial(x._lazy_expr)
+            type(x) is not xla.DeviceArray or xla.lazy.is_trivial(x._lazy_expr)
             for x in args_flat))
 
     ### If we can use the fastpath, we return required info to the caller.
@@ -379,7 +348,24 @@ def _cpp_jit(
   @wraps(fun)
   @api_boundary
   def f_jitted(*args, **kwargs):
-    return cpp_jitted_f(*args, **kwargs)
+    # TODO(jblespiau): Move this to C++.
+    if FLAGS.jax_debug_nans and not _jit_is_disabled():
+      device_arrays = cpp_jitted_f(*args, **kwargs)
+      try:
+        xla.check_nans(xla.xla_call_p, [
+            da.device_buffer
+            for da in tree_leaves(device_arrays)
+            if hasattr(da, "device_buffer")
+        ])
+        return device_arrays
+      except FloatingPointError:
+        assert FLAGS.jax_debug_nans  # compiled_fun can only raise in this case
+        print("Invalid nan value encountered in the output of a C++-jit "
+              "function. Calling the de-optimized version.")
+        return cache_miss(*args, **kwargs)[0]  # probably won't return
+    else:
+      return cpp_jitted_f(*args, **kwargs)
+  f_jitted._cpp_jitted_f = cpp_jitted_f
 
   return f_jitted
 
@@ -674,8 +660,8 @@ def _xla_computation(
     c = xb.make_computation_builder("xla_computation_{}".format(fun_name))
     xla_consts = map(partial(xb.constant, c), consts)
     should_tuple = tuple_args if tuple_args is not None else (len(avals) > 100)
-    xla_args = xla._xla_callable_args(
-        c, avals, should_tuple, partitions=in_parts_flat)
+    xla_args, donated_invars = xla._xla_callable_args(
+        c, avals, should_tuple, partitions=in_parts_flat, donated_invars=donated_invars)
     out_nodes = xla.jaxpr_subcomp(
         c, jaxpr, backend, axis_env_, xla_consts,
         extend_name_stack(wrap_name(fun_name, "xla_computation")), *xla_args)
@@ -1212,7 +1198,7 @@ def vmap(fun: Callable[..., T], in_axes=0, out_axes=0, axis_name=None) -> Callab
     docstr += "\n\nOriginal documentation:\n\n"
     docstr += fun.__doc__
 
-  axis_name = _TempAxisName(fun) if axis_name is None else axis_name
+  axis_name = core._TempAxisName(fun) if axis_name is None else axis_name
 
   if isinstance(in_axes, list):
     # To be a tree prefix of the positional args tuple, in_axes can never be a
@@ -1249,14 +1235,15 @@ def vmap(fun: Callable[..., T], in_axes=0, out_axes=0, axis_name=None) -> Callab
 
   return batched_fun
 
-def _get_axis_size(name: str, i:int, shape: Tuple[int, ...], axis: int):
-  try:
-    return shape[axis]
-  except (IndexError, TypeError) as e:
-    raise ValueError(f"{name} got arg {i} of rank {len(shape)} "
-                     f"but axis to be mapped {axis}") from e
-
 def _mapped_axis_size(tree, vals, dims, name):
+  def _get_axis_size(name: str, i:int, shape: Tuple[int, ...], axis: int):
+    try:
+      return shape[axis]
+    except (IndexError, TypeError) as e:
+      ranks = tree_unflatten(tree, [np.ndim(x) for x, d in zip(vals, dims)])
+      raise ValueError(f"{name} got arg {i} of rank {len(shape)} but axis to be mapped {axis}. "
+                       f"The tree of ranks is:\n{ranks}") from e
+
   mapped_axis_sizes = {_get_axis_size(name, i, np.shape(x), d)
                        for i, (x, d) in enumerate(zip(vals, dims))
                        if d is not None}
@@ -1502,7 +1489,7 @@ def pmap(fun: Callable[..., T],
   # the given value.
 
   _check_callable(fun)
-  axis_name = _TempAxisName(fun) if axis_name is None else axis_name
+  axis_name = core._TempAxisName(fun) if axis_name is None else axis_name
   static_broadcasted_tuple = _ensure_tuple(static_broadcasted_argnums)
   donate_tuple = rebase_donate_argnums(_ensure_tuple(donate_argnums),
                                        static_broadcasted_tuple)
@@ -1549,22 +1536,6 @@ def pmap(fun: Callable[..., T],
 
   return f_pmapped
 
-# When a mapped function is given no axis name, we generate a name object based
-# on the id of the function object. Collisions aren't important because this
-# name can't be used in collectives, as user code never gets a ref to this
-# object. We don't want to use the function object itself because that might
-# persist references to the function object.
-# TODO(mattjj): revisit this unique axis name strategy
-class _TempAxisName:
-  def __init__(self, obj):
-    self.id = id(obj)
-  def __repr__(self):
-    return f'<axis {hex(self.id)}>'
-  def __hash__(self):
-    return hash(self.id)
-  def __eq__(self, other):
-    return type(other) is _TempAxisName and self.id == other.id
-
 
 def soft_pmap(fun: Callable, axis_name: Optional[AxisName] = None, in_axes=0
               ) -> Callable:
@@ -1572,7 +1543,7 @@ def soft_pmap(fun: Callable, axis_name: Optional[AxisName] = None, in_axes=0
     raise NotImplementedError("soft_pmap requires omnistaging.")
   warn("soft_pmap is an experimental feature and probably has bugs!")
   _check_callable(fun)
-  axis_name = _TempAxisName(fun) if axis_name is None else axis_name
+  axis_name = core._TempAxisName(fun) if axis_name is None else axis_name
 
   if any(axis != 0 for axis in tree_leaves(in_axes)):
     raise ValueError(f"soft_pmap in_axes leaves must be 0 or None, got {in_axes}")
@@ -1791,11 +1762,12 @@ def _lift_linearized(jaxpr, primal_avals, consts, io_tree, out_pvals, *py_args):
     tangent_avals = list(map(core.get_aval, tangents))
     for primal_aval, tangent_aval in zip(primal_avals, tangent_avals):
       try:
-        core.lattice_join(primal_aval, tangent_aval)
+        core.lattice_join(primal_aval.at_least_vspace(), tangent_aval)
       except TypeError as e:
         msg = ("linearized function called on tangent values inconsistent with "
-               "the original primal values.")
-        raise ValueError(msg) from e
+               "the original primal values: "
+               f"got {tangent_aval} for primal aval {primal_aval}")
+        raise ValueError(msg)
     tangents_out = eval_jaxpr(jaxpr, consts, *tangents)
     return tuple(map(lambda out_pv, tan_out: out_pv.merge_with_known(tan_out),
                      out_pvals, tangents_out))

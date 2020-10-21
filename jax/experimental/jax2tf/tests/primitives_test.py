@@ -24,6 +24,7 @@ import itertools
 import jax
 from jax import dtypes
 from jax import lax
+from jax import lax_linalg
 from jax import numpy as jnp
 from jax import test_util as jtu
 from jax.config import config
@@ -69,7 +70,7 @@ class JaxPrimitiveTest(tf_test_util.JaxToTfTestCase):
                       | set(xla.initial_style_translations)
                       | set(xla.parallel_translations))
 
-    tf_impl = set(jax.experimental.jax2tf.jax2tf.tf_impl)
+    tf_impl = set(jax.experimental.jax2tf.jax2tf.tf_impl) | set(jax.experimental.jax2tf.jax2tf.tf_impl_with_avals)
     tf_not_yet_impl = set(jax.experimental.jax2tf.jax2tf.tf_not_yet_impl)
 
     all_primitives = tuple(sorted(all_primitives, key=str))
@@ -402,6 +403,72 @@ class JaxPrimitiveTest(tf_test_util.JaxToTfTestCase):
                            custom_assert=custom_assert,
                            always_custom_assert=always_custom_assert)
 
+  @primitive_harness.parameterized(primitive_harness.lax_linalg_lu)
+  def test_lu(self, harness: primitive_harness.Harness):
+    dtype = harness.params["dtype"]
+    if dtype in [np.float16, dtypes.bfloat16]:
+      raise unittest.SkipTest(
+        f"LU is not implemented in JAX for dtype {dtype}.")
+    tol = None
+    if dtype in [np.float32, np.complex64]:
+      if jtu.device_under_test() == "tpu":
+        tol = 0.1
+      else:
+        tol = 1e-5
+    if dtype in [np.float64, np.complex128]:
+      tol = 1e-13
+    operand, = harness.dyn_args_maker(self.rng())
+
+    def custom_assert(result_jax, result_tf):
+      lu, pivots, perm = tuple(map(lambda t: t.numpy(), result_tf))
+      batch_dims = operand.shape[:-2]
+      m, n = operand.shape[-2], operand.shape[-1]
+      def _make_permutation_matrix(perm):
+        result = []
+        for idx in itertools.product(*map(range, operand.shape[:-1])):
+          result += [0 if c != perm[idx] else 1 for c in range(m)]
+        result = np.reshape(np.array(result, dtype=dtype), [*batch_dims, m, m])
+        return result
+
+      k = min(m, n)
+      l = jnp.tril(lu, -1)[...,:, :k] + jnp.eye(m, k, dtype=dtype)
+      u = jnp.triu(lu)[...,:k, :]
+      p_mat = _make_permutation_matrix(perm)
+
+      self.assertArraysEqual(lax_linalg.lu_pivots_to_permutation(pivots, m),
+                             perm)
+      self.assertAllClose(jnp.matmul(p_mat, operand), jnp.matmul(l, u),
+                          atol=tol, rtol=tol)
+
+    self.ConvertAndCompare(harness.dyn_fun, operand, atol=tol, rtol=tol,
+                           custom_assert=custom_assert,
+                           always_custom_assert=True)
+
+  @primitive_harness.parameterized(
+      primitive_harness.lax_linalg_triangular_solve)
+  def test_triangular_solve(self, harness: primitive_harness.Harness):
+    dtype = harness.params["dtype"]
+    if dtype == np.float16 and jtu.device_under_test() == "gpu":
+      raise unittest.SkipTest(
+        f"Triangular solve is not implemented in JAX for dtype {dtype}")
+    atol = rtol = None
+    if dtype == np.float32:
+      atol = rtol = 1e-5
+    self.ConvertAndCompare(harness.dyn_fun, *harness.dyn_args_maker(self.rng()),
+                           atol=atol, rtol=rtol)
+
+  @primitive_harness.parameterized(primitive_harness.lax_linear_solve)
+  def test_linear_solve(self, harness: primitive_harness.Harness):
+    a, b = harness.dyn_args_maker(self.rng())
+    if harness.params["symmetric"]:
+      a = a + a.T
+    tol = None
+    if (harness.params["dtype"] == np.float32 and
+        jtu.device_under_test() == "tpu"):
+      tol = 0.01
+
+    self.ConvertAndCompare(harness.dyn_fun, a, b, atol=tol, rtol=tol)
+
   @primitive_harness.parameterized(primitive_harness.lax_unary_elementwise)
   def test_unary_elementwise(self, harness: primitive_harness.Harness):
     dtype = harness.params["dtype"]
@@ -608,24 +675,47 @@ class JaxPrimitiveTest(tf_test_util.JaxToTfTestCase):
   def test_squeeze(self, harness: primitive_harness.Harness):
     self.ConvertAndCompare(harness.dyn_fun, *harness.dyn_args_maker(self.rng()))
 
+  @primitive_harness.parameterized(primitive_harness.lax_dot_general)
+  def test_dot_general(self, harness: primitive_harness.Harness):
+    tol, dtype = None, harness.params["dtype"]
+    if dtype == dtypes.bfloat16:
+      tol = 0.3
+    elif dtype in [np.complex64, np.float32]:
+      if jtu.device_under_test() == "tpu":
+        tol = 0.1 if dtype == np.float32 else 0.3
+      else:
+        tol = 1e-5
+    elif dtype == np.float16:
+      if jtu.device_under_test() == "gpu":
+        tol = 0.1
+      else:
+        tol = 0.01
+    self.ConvertAndCompare(harness.dyn_fun, *harness.dyn_args_maker(self.rng()),
+                           atol=tol, rtol=tol)
+
   @primitive_harness.parameterized(primitive_harness.lax_conv_general_dilated)
   def test_conv_general_dilated(self, harness: primitive_harness.Harness):
-    if jtu.device_under_test() == "gpu" and harness.params["dtype"] in [np.complex64, np.complex128]:
+    dtype, device = harness.params["dtype"], jtu.device_under_test()
+    if device == "gpu" and dtype in [np.complex64, np.complex128]:
       raise unittest.SkipTest("TODO: crash on GPU in TF")
 
     tol = None
-    if jtu.device_under_test() == "gpu":
+    if device == "gpu":
       tol = 1e-4
-    elif jtu.device_under_test() == "tpu":
+    elif device == "tpu":
       tol = 1e-3
     # TODO(bchetioui): significant discrepancies in some float16 cases.
-    if harness.params["dtype"] == np.float16:
+    if dtype == np.float16:
       tol = 1.
     # TODO(bchetioui): slight occasional discrepancy in float32 cases.
-    elif harness.params["dtype"] == np.float32:
-      tol = 0.5 if jtu.device_under_test() == "tpu" else 1e-4
-    elif harness.params["dtype"] == np.complex64 and jtu.device_under_test() == "tpu":
+    elif dtype == np.float32:
+      tol = 0.5 if device == "tpu" else (1e-3 if device == "gpu" else 1e-4)
+    elif dtype == np.complex64 and device == "tpu":
       tol = 0.1
+    # TODO(bchetioui): slight discrepancy when going through the path using
+    # tf.nn.convolution.
+    elif dtype == np.float64 and device == "cpu":
+      tol = 1e-13
     self.ConvertAndCompare(harness.dyn_fun, *harness.dyn_args_maker(self.rng()),
                            atol=tol, rtol=tol)
 
