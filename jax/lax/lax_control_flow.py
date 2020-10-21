@@ -16,4 +16,3 @@
 
 # flake8: noqa: F401
 from jax._src.lax.control_flow import _initial_style_jaxpr
->>>>>>> master:jax/lax/lax_control_flow.py
