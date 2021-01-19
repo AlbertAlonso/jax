@@ -74,13 +74,13 @@ class AbstractSparseArray(core.ShapedArray):
   def indices(self):
     return sp_indices_p.bind(self)
 
-def abstract_sparse_array(arr):
-  return AbstractSparseArray(arr.shape, arr.dtype, arr.index_dtype, arr.nnz)
+class ConcreteSparseArray(AbstractSparseArray):
+  pass
 
 def sparse_array_result_handler(device, aval):
   def build_sparse_array(data_buf, indices_buf):
-    data = xla.DeviceArray(aval.data_aval, device, lazy.array(aval.data_aval.shape), data_buf)
-    indices = xla.DeviceArray(aval.indices_aval, device, lazy.array(aval.indices_aval.shape), indices_buf)
+    data = xla.make_device_array(aval.data_aval, device, lazy.array(aval.data_aval.shape), data_buf)
+    indices = xla.make_device_array(aval.indices_aval, device, lazy.array(aval.indices_aval.shape), indices_buf)
     return SparseArray(aval, data, indices)
   return build_sparse_array
 
@@ -96,9 +96,9 @@ def sparse_array_device_put_handler(a, device):
     xla.xb.get_device_backend(device).buffer_from_pyval(a.indices, device)
   )
 
-core.pytype_aval_mappings[SparseArray] = abstract_sparse_array
+core.pytype_aval_mappings[SparseArray] = lambda x: x.aval
 core.raise_to_shaped_mappings[AbstractSparseArray] = lambda aval, _: aval
-xla.pytype_aval_mappings[SparseArray] = abstract_sparse_array
+xla.pytype_aval_mappings[SparseArray] = lambda x: x.aval
 xla.canonicalize_dtype_handlers[SparseArray] = lambda x: x
 xla.device_put_handlers[SparseArray] = sparse_array_device_put_handler
 xla.xla_result_handlers[AbstractSparseArray] = sparse_array_result_handler
@@ -118,6 +118,8 @@ def _sp_indices_abstract_eval(mat):
 def _sp_indices_translation_rule(c, data, indices):
   return indices
 
+# Note: cannot use lower_fun to define attribute access primitives
+# because it leads to infinite recursion.
 xla.translations[sp_indices_p] = _sp_indices_translation_rule
 
 sp_data_p = core.Primitive('sp_data')
@@ -133,6 +135,8 @@ def _sp_data_abstract_eval(mat):
 def _sp_data_translation_rule(c, data, indices):
   return data
 
+# Note: cannot use lower_fun to define attribute access primitives
+# because it leads to infinite recursion.
 xla.translations[sp_data_p] = _sp_data_translation_rule
 
 def identity(x):
@@ -142,16 +146,30 @@ identity_p = core.Primitive('identity')
 
 @identity_p.def_impl
 def _identity_impl(mat):
-  return SparseArray(mat.aval, mat.data, mat.indices)
+  return mat
 
 @identity_p.def_abstract_eval
 def _identity_abstract_eval(mat):
-  return mat
+  return AbstractSparseArray(mat.shape, mat.dtype, mat.index_dtype, mat.nnz)
 
-def _identity_translation_rule(c, data, indices):
-  return xops.Tuple(c, (data, indices))
+xla.translations_with_avals[identity_p] = xla.lower_fun(_identity_impl, multiple_results=False, with_avals=True)
 
-xla.translations[identity_p] = _identity_translation_rule
+def split(x):
+  return split_p.bind(x)
+
+split_p = core.Primitive('split')
+split_p.multiple_results = True
+
+@split_p.def_impl
+def _split_impl(mat):
+  return mat, mat
+
+@split_p.def_abstract_eval
+def _split_abstract_eval(mat):
+  m = AbstractSparseArray(mat.shape, mat.dtype, mat.index_dtype, mat.nnz)
+  return m, m
+
+xla.translations_with_avals[split_p] = xla.lower_fun(_split_impl, multiple_results=True, with_avals=True)
 
 def make_sparse_array(rng, shape, dtype, nnz=0.2):
   mat = rng(shape, dtype)
@@ -199,13 +217,13 @@ class AbstractEmpty(core.AbstractValue):
   def __eq__(self, other):
     return isinstance(other, AbstractEmpty)
 
+class ConcreteEmpty(AbstractEmpty):
+  pass
 
-def abstract_empty(e):
-  return AbstractEmpty()
 
-core.pytype_aval_mappings[Empty] = abstract_empty
+core.pytype_aval_mappings[Empty] = lambda x: ConcreteEmpty()
 core.raise_to_shaped_mappings[AbstractEmpty] = lambda aval, _: aval
-xla.pytype_aval_mappings[Empty] = abstract_empty
+xla.pytype_aval_mappings[Empty] = lambda x: AbstractEmpty()
 xla.canonicalize_dtype_handlers[Empty] = lambda x: x
 xla.device_put_handlers[Empty] = lambda _, __: ()
 xla.xla_result_handlers[AbstractEmpty] = lambda _, __: lambda: Empty(AbstractEmpty())
@@ -233,6 +251,25 @@ class CustomObjectTest(jtu.JaxTestCase):
     self.assertEqual(M.index_dtype, M2.index_dtype)
     self.assertAllClose(M.data, M2.data)
     self.assertAllClose(M.indices, M2.indices)
+
+  @parameterized.named_parameters(jtu.cases_from_list(
+      {"testcase_name": "_compile={}".format(compile),
+       "compile": compile}
+      for compile in [True, False]))
+  def testSparseSplit(self, compile):
+    f = jit(split) if compile else split
+    rng = jtu.rand_default(self.rng())
+    M = make_sparse_array(rng, (10,), jnp.float32)
+    M2, M3 = f(M)
+
+    jaxpr = make_jaxpr(f)(M).jaxpr
+    core.check_jaxpr(jaxpr)
+
+    for MM in M2, M3:
+      self.assertEqual(M.dtype, MM.dtype)
+      self.assertEqual(M.index_dtype, MM.index_dtype)
+      self.assertArraysEqual(M.data, MM.data)
+      self.assertArraysEqual(M.indices, MM.indices)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_compile={}_primitive={}".format(compile, primitive),

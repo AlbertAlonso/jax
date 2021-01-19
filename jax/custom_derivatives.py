@@ -19,11 +19,13 @@ import operator as op
 from typing import Callable, Sequence, Tuple, Any
 
 from . import core
+from . import dtypes
 from . import linear_util as lu
-from .tree_util import tree_flatten, tree_unflatten, tree_map, tree_multimap
-from .util import safe_zip, safe_map, split_list
+from .tree_util import (tree_flatten, tree_unflatten, tree_map, tree_multimap,
+                        register_pytree_node_class)
+from ._src.util import cache, safe_zip, safe_map, split_list
 from .api_util import flatten_fun_nokwargs, argnums_partial, wrap_hashably
-from .abstract_arrays import raise_to_shaped
+from .core import raise_to_shaped
 from .ad_util import Zero, zeros_like_aval, stop_gradient_p
 from .interpreters import partial_eval as pe
 from .interpreters import ad
@@ -31,6 +33,9 @@ from .interpreters import batching
 from .interpreters import xla
 from .interpreters.batching import not_mapped
 from .config import config
+
+from ._src import traceback_util
+traceback_util.register_exclusion(__file__)
 
 map = safe_map
 zip = safe_zip
@@ -75,10 +80,18 @@ class custom_jvp:
   This class is meant to be used as a function decorator. Instances are
   callables that behave similarly to the underlying function to which the
   decorator was applied, except when a differentiation transformation (like
-  :py:func:`jax.jvp` or :py:func:`jax.grad`) is applied, in which case a custom user-supplied
-  JVP rule function is used instead of tracing into and performing automatic
-  differentiation of the underlying function's implementation. There is a single
-  instance method, ``defjvp``, which defines the custom JVP rule.
+  :py:func:`jax.jvp` or :py:func:`jax.grad`) is applied, in which case a custom
+  user-supplied JVP rule function is used instead of tracing into and
+  performing automatic differentiation of the underlying function's
+  implementation.
+
+  There are two instance methods available for defining the custom JVP rule:
+  :py:func:`~jax.custom_jvp.defjvp` for defining a *single* custom JVP rule for
+  all the function's inputs, and for convenience
+  :py:func:`~jax.custom_jvp.defjvps`, which wraps
+  :py:func:`~jax.custom_jvp.defjvp`, and allows you to provide separate
+  definitions for the partial derivatives of the function w.r.t. each of its
+  arguments.
 
   For example::
 
@@ -258,9 +271,9 @@ class CustomJVPCallPrimitive(core.CallPrimitive):
     args = map(core.full_lower, args)
     top_trace = core.find_top_trace(args)
     fun, env_trace_todo1 = core.process_env_traces(
-        fun, self, top_trace and top_trace.level, ())
+        fun, self, top_trace and top_trace.level, (), None)
     jvp, env_trace_todo2 = core.process_env_traces(
-        jvp, self, top_trace and top_trace.level, ())
+        jvp, self, top_trace and top_trace.level, (), None)
     tracers = map(top_trace.full_raise, args)  # type: ignore
     with core.maybe_new_sublevel(top_trace):
       outs = top_trace.process_custom_jvp_call(self, fun, jvp, tracers)  # type: ignore
@@ -316,7 +329,7 @@ def _custom_jvp_call_jaxpr_jvp(
 ad.primitive_jvps[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_jvp
 
 def _custom_jvp_call_jaxpr_vmap(
-    args, in_dims, *, fun_jaxpr: core.ClosedJaxpr,
+    args, in_dims, axis_name, *, fun_jaxpr: core.ClosedJaxpr,
     jvp_jaxpr_thunk: Callable[[], Tuple[core.Jaxpr, Sequence[Any]]],
     num_consts: int):
   size, = {x.shape[d] for x, d in zip(args, in_dims) if d is not not_mapped}
@@ -325,7 +338,7 @@ def _custom_jvp_call_jaxpr_vmap(
   num_out = len(fun_jaxpr.out_avals)
 
   in_batched = [d is not not_mapped for d in in_dims]
-  batched_fun_jaxpr, out_batched = batching.batch_jaxpr(fun_jaxpr, size, in_batched, False)
+  batched_fun_jaxpr, out_batched = batching.batch_jaxpr(fun_jaxpr, size, in_batched, False, axis_name)
   out_dims1 = [0 if b else not_mapped for b in out_batched]
   out_dims2 = []  # mutable cell updated by batched_jvp_jaxpr_thunk
 
@@ -333,12 +346,12 @@ def _custom_jvp_call_jaxpr_vmap(
   def batched_jvp_jaxpr_thunk():
     jvp_jaxpr = core.ClosedJaxpr(*jvp_jaxpr_thunk())  # consts can be tracers
     _, args_batched = split_list(in_batched, [num_consts])
-    _, all_batched = batching.batch_jaxpr(jvp_jaxpr, size, args_batched * 2, False)
+    _, all_batched = batching.batch_jaxpr(jvp_jaxpr, size, args_batched * 2, False, axis_name)
     primals_batched, tangents_batched = split_list(all_batched, [num_out])
     out_batched = map(op.or_, primals_batched, tangents_batched)
     out_dims2.append([0 if b else not_mapped for b in out_batched])
     batched_jvp_jaxpr, _ = batching.batch_jaxpr(
-        jvp_jaxpr, size, args_batched * 2, out_batched * 2)
+        jvp_jaxpr, size, args_batched * 2, out_batched * 2, axis_name)
     return batched_jvp_jaxpr.jaxpr, batched_jvp_jaxpr.consts
 
   batched_outs = custom_jvp_call_jaxpr_p.bind(
@@ -346,7 +359,7 @@ def _custom_jvp_call_jaxpr_vmap(
       jvp_jaxpr_thunk=batched_jvp_jaxpr_thunk, num_consts=num_consts)
   out_dims = out_dims2[0] if out_dims2 else out_dims1
   return batched_outs, out_dims
-batching.primitive_batchers[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_vmap
+batching.initial_style_batchers[custom_jvp_call_jaxpr_p] = _custom_jvp_call_jaxpr_vmap
 
 xla.initial_style_translations[custom_jvp_call_jaxpr_p] = \
     xla.lower_fun_initial_style(_custom_jvp_call_jaxpr_impl)
@@ -372,7 +385,8 @@ class custom_vjp:
   transformation (like :py:func:`jax.grad`) is applied, in which case a custom
   user-supplied VJP rule function is used instead of tracing into and performing
   automatic differentiation of the underlying function's implementation. There
-  is a single instance method, ``defvjp``, which defines the custom VJP rule.
+  is a single instance method, :py:func:`~jax.custom_vjp.defvjp`, which may be
+  used to define the custom VJP rule.
 
   This decorator precludes the use of forward-mode automatic differentiation.
 
@@ -556,9 +570,9 @@ class CustomVJPCallPrimitive(core.CallPrimitive):
     args = map(core.full_lower, args)
     top_trace = core.find_top_trace(args)
     fun, env_trace_todo1 = core.process_env_traces(
-        fun, self, top_trace and top_trace.level, ())
+        fun, self, top_trace and top_trace.level, (), None)
     fwd, env_trace_todo2 = core.process_env_traces(
-        fwd, self, top_trace and top_trace.level, ())
+        fwd, self, top_trace and top_trace.level, (), None)
     tracers = map(top_trace.full_raise, args)  # type: ignore
     with core.maybe_new_sublevel(top_trace):
       outs = top_trace.process_custom_vjp_call(self, fun, fwd, bwd, tracers,
@@ -610,7 +624,7 @@ def _custom_vjp_call_jaxpr_jvp(
 ad.primitive_jvps[custom_vjp_call_jaxpr_p] = _custom_vjp_call_jaxpr_jvp
 
 def _custom_vjp_call_jaxpr_vmap(
-    args, in_dims, *, fun_jaxpr: core.ClosedJaxpr,
+    args, in_dims, axis_name, *, fun_jaxpr: core.ClosedJaxpr,
     fwd_jaxpr_thunk: Callable[[], Tuple[core.Jaxpr, Sequence[Any]]],
     bwd: lu.WrappedFun, out_trees: Callable, num_consts: int):
   size, = {x.shape[d] for x, d in zip(args, in_dims) if d is not not_mapped}
@@ -619,7 +633,7 @@ def _custom_vjp_call_jaxpr_vmap(
 
   in_batched = [d is not not_mapped for d in in_dims]
   _, args_batched = split_list(in_batched, [num_consts])
-  batched_fun_jaxpr, out_batched = batching.batch_jaxpr(fun_jaxpr, size, in_batched, False)
+  batched_fun_jaxpr, out_batched = batching.batch_jaxpr(fun_jaxpr, size, in_batched, False, axis_name)
   out_dims1 = [0 if b else not_mapped for b in out_batched]
   out_dims2 = []
 
@@ -627,7 +641,7 @@ def _custom_vjp_call_jaxpr_vmap(
   def batched_fwd_jaxpr_thunk():
     fwd_jaxpr = core.ClosedJaxpr(*fwd_jaxpr_thunk())  # consts can be tracers
     batched_fwd_jaxpr, out_batched = batching.batch_jaxpr(
-        fwd_jaxpr, size, args_batched, False)
+        fwd_jaxpr, size, args_batched, False, axis_name)
     out_dims2.append([0 if b else not_mapped for b in out_batched])
     return batched_fwd_jaxpr.jaxpr, batched_fwd_jaxpr.consts
 
@@ -645,7 +659,7 @@ def _custom_vjp_call_jaxpr_vmap(
   if not config.omnistaging_enabled:
     out_dims = out_dims[:len(batched_outs)]
   return batched_outs, out_dims
-batching.primitive_batchers[custom_vjp_call_jaxpr_p] = _custom_vjp_call_jaxpr_vmap
+batching.initial_style_batchers[custom_vjp_call_jaxpr_p] = _custom_vjp_call_jaxpr_vmap
 
 xla.initial_style_translations[custom_vjp_call_jaxpr_p] = \
     xla.lower_fun_initial_style(_custom_vjp_call_jaxpr_impl)
@@ -668,9 +682,9 @@ def omnistaging_disabler() -> None:
     args = map(core.full_lower, args)
     top_trace = core.find_top_trace(args)
     fun, env_trace_todo1 = core.process_env_traces(
-        fun, self, top_trace and top_trace.level, ())
+        fun, self, top_trace and top_trace.level, (), None)
     jvp, env_trace_todo2 = core.process_env_traces(
-        jvp, self, top_trace and top_trace.level, ())
+        jvp, self, top_trace and top_trace.level, (), None)
     if top_trace is None:
       with core.new_sublevel():
         outs = self.impl(fun, jvp, *args)
@@ -721,3 +735,211 @@ def omnistaging_disabler() -> None:
         *consts, *args, fun_jaxpr=closed_fun_jaxpr,
         fwd_jaxpr_thunk=fwd_jaxpr_thunk, bwd=bwd, out_trees=out_trees,
         num_consts=len(consts))
+
+
+def custom_gradient(fun):
+  """Convenience function for defining custom VJP rules (aka custom gradients).
+
+  While the canonical way to define custom VJP rules is via ``jax.custom_vjp``,
+  the ``custom_gradient`` convenience wrapper follows TensorFlow's
+  ``tf.custom_gradient`` API. The difference here is that ``custom_gradient``
+  can be used as a decorator on one function that returns both the primal value
+  (representing the output of the mathematical function to be differentiated)
+  and the VJP (gradient) function. See
+  https://www.tensorflow.org/api_docs/python/tf/custom_gradient.
+
+  If the mathematical function to be differentiated has type signature ``a ->
+  b``, then the Python callable ``fun`` should have signature
+  ``a -> (b, CT b --o CT a)`` where we use ``CT x`` to denote a cotangent type
+  for ``x`` and the ``--o`` arrow to denote a linear function. See the example
+  below. That is, ``fun`` should return a pair where the first element
+  represents the value of the mathematical function to be differentiated and the
+  second element is a function to be called on the backward pass of reverse-mode
+  automatic differentiation (i.e. the "custom gradient" function).
+
+  The function returned as the second element of the output of ``fun`` can close
+  over intermediate values computed when evaluating the function to be
+  differentiated. That is, use lexical closure to share work between the forward
+  pass and the backward pass of reverse-mode automatic differentiation. However,
+  it cannot support Python control flow.
+
+  Args:
+    fun: a Python callable specifying both the mathematical function to be
+      differentiated and its reverse-mode differentiation rule. It should return
+      a pair consisting of an output value and a Python callable that represents
+      the custom gradient function.
+
+  Returns:
+    A Python callable that accepts the same arguments as ``fun`` and returns the
+    output value specified by the first element of ``fun``'s output pair.
+
+  For example:
+
+  >>> @jax.custom_gradient
+  ... def f(x):
+  ...   return x ** 2, lambda g: (g * x,)
+  ...
+  >>> print(f(3.))
+  9.0
+  >>> print(jax.grad(f)(3.))
+  3.0
+
+  An example with a function on two arguments, so that the VJP function must
+  return a tuple of length two:
+
+  >>> @jax.custom_gradient
+  ... def f(x, y):
+  ...   return x * y, lambda g: (y, x)
+  ...
+  >>> print(f(3., 4.))
+  12.0
+  >>> print(jax.grad(f, argnums=(0, 1))(3., 4.))
+  (4.0, 3.0)
+  """
+  @custom_vjp
+  def wrapped_fun(*args, **kwargs):
+    ans, _ = fun(*args, **kwargs)
+    return ans
+
+  def fwd(*args, **kwargs):
+    ans, rule = fun(*args, **kwargs)
+    ans_flat, out_tree = tree_flatten((ans,))
+    rule, in_tree = flatten_fun_nokwargs(lu.wrap_init(rule), out_tree)
+    ans_avals = [core.get_aval(x).at_least_vspace() for x in ans_flat]
+    if config.omnistaging_enabled:
+      jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(rule, ans_avals)
+    else:
+      ans_pvals = [pe.PartialVal.unknown(a) for a in ans_avals]
+      jaxpr, _, consts = pe.trace_to_jaxpr(rule, ans_pvals, instantiate=True)
+    return ans, Residuals(jaxpr, in_tree(), out_tree, consts)
+
+  def bwd(res, cts):
+    jaxpr, in_tree, out_tree, consts = res
+    cts_flat, out_tree_ = tree_flatten((cts,))
+    if out_tree != out_tree_: raise TypeError(f'{out_tree}\n!=\n{out_tree_}')
+    cts_out = core.eval_jaxpr(jaxpr, consts, *cts_flat)
+    return tree_unflatten(in_tree, cts_out)
+
+  wrapped_fun.defvjp(fwd, bwd)
+  return wrapped_fun
+
+@register_pytree_node_class
+class Residuals:
+  def __init__(self, jaxpr, in_tree, out_tree, consts):
+    self.jaxpr = jaxpr
+    self.in_tree = in_tree
+    self.out_tree = out_tree
+    self.consts = consts
+  def __iter__(self):
+    return iter((self.jaxpr, self.in_tree, self.out_tree, self.consts))
+  def tree_flatten(self):
+    return self.consts, (self.jaxpr, self.in_tree, self.out_tree)
+  @classmethod
+  def tree_unflatten(cls, aux, consts):
+    jaxpr, in_tree, out_tree = aux
+    return cls(jaxpr, in_tree, out_tree, consts)
+
+
+def closure_convert(fun, *example_args):
+  """Closure conversion utility, for use with higher-order custom derivatives.
+
+  To define custom derivatives such as with ``jax.custom_vjp(f)``, the target
+  function ``f`` must take, as formal arguments, all values involved in
+  differentiation. If ``f`` is a higher-order function, in that it accepts as an
+  argument a Python function ``g``, then values stored away in ``g``'s closure
+  will not be visible to the custom derivative rules, and attempts at AD
+  involving these values will fail. One way around this is to convert the
+  closure by extracting these values, and to pass them as explicit formal
+  arguments across the custom derivative boundary. This utility carries out that
+  conversion. More precisely, it closure-converts the function ``fun``
+  specialized to the types of the arguments given in ``example_args``.
+
+  When we refer here to "values in the closure" of ``fun``, we do not mean the
+  values that are captured by Python directly when ``fun`` is defined (e.g. the
+  Python objects in ``fun.__closure__``, if the attribute exists). Rather, we
+  mean values encountered during the execution of ``fun`` on ``example_args``
+  that determine its output. This may include, for instance, arrays captured
+  transitively in Python closures, i.e. in the Python closure of functions
+  called by ``fun``, the closures of the functions that they call, and so forth.
+
+  The function ``fun`` must be a pure function.
+
+  Example usage::
+
+    def minimize(objective_fn, x0):
+      converted_fn, aux_args = closure_convert(objective_fn, x0)
+      return _minimize(converted_fn, x0, *aux_args)
+
+    @partial(custom_vjp, nondiff_argnums=(0,))
+    def _minimize(objective_fn, x0, *args):
+      z = objective_fn(x0, *args)
+      # ... find minimizer x_opt ...
+      return x_opt
+
+    def fwd(objective_fn, x0, *args):
+      y = _minimize(objective_fn, x0, *args)
+      return y, (y, args)
+
+    def rev(objective_fn, res, g):
+      y, args = res
+      y_bar = g
+      # ... custom reverse-mode AD ...
+      return x0_bar, *args_bars
+
+    _minimize.defvjp(fwd, rev)
+
+  Args:
+    fun: Python callable to be converted. Must be a pure function.
+    example_args: Arrays, scalars, or (nested) standard Python
+      containers (tuples, lists, dicts, namedtuples, i.e., pytrees)
+      thereof, used to determine the types of the formal arguments to
+      ``fun``. This type-specialized form of ``fun`` is the function
+      that will be closure converted.
+
+  """
+  flat_args, in_tree = tree_flatten(example_args)
+  in_avals = tuple(map(abstractify, flat_args))
+  return _closure_convert_for_avals(fun, in_tree, in_avals)
+
+@cache()
+def _closure_convert_for_avals(fun, in_tree, in_avals):
+  if config.omnistaging_enabled:
+    wrapped_fun, out_tree = flatten_fun_nokwargs(lu.wrap_init(fun), in_tree)
+    jaxpr, out_pvals, consts = pe.trace_to_jaxpr_dynamic(wrapped_fun, in_avals)
+  else:
+    in_pvals = [pe.PartialVal.unknown(aval) for aval in in_avals]
+    wrapped_fun, out_tree = flatten_fun_nokwargs(lu.wrap_init(fun), in_tree)
+    with core.initial_style_staging():  # type: ignore
+      jaxpr, out_pvals, consts = pe.trace_to_jaxpr(
+        wrapped_fun, in_pvals, instantiate=True, stage_out=False)  # type: ignore
+  out_tree = out_tree()
+
+  # We only want to closure convert for constants with respect to which we're
+  # differentiating. As a proxy for that, we hoist consts with float dtype.
+  # TODO(mattjj): revise this approach
+  from .numpy import inexact
+  is_float = lambda c: dtypes.issubdtype(dtypes.dtype(c), inexact)
+  (closure_consts, hoisted_consts), merge = partition_list(is_float, consts)
+  num_consts = len(hoisted_consts)
+
+  def converted_fun(*args_hconsts):
+    num_args = len(args_hconsts) - num_consts
+    args, hoisted_consts = split_list(args_hconsts, [num_args])
+    consts = merge(closure_consts, hoisted_consts)
+    all_args, in_tree2 = tree_flatten(tuple(args))
+    assert in_tree == in_tree2
+    out_flat = core.eval_jaxpr(jaxpr, consts, *all_args)
+    return tree_unflatten(out_tree, out_flat)
+
+  return converted_fun, hoisted_consts
+
+def partition_list(choice, lst):
+  out = [], []
+  which = [out[choice(elt)].append(elt) or choice(elt) for elt in lst]
+  def merge(l1, l2):
+    i1, i2 = iter(l1), iter(l2)
+    return [next(i2 if snd else i1) for snd in which]
+  return out, merge
+
+def abstractify(x):
+  return core.raise_to_shaped(core.get_aval(x))

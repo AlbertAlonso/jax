@@ -19,10 +19,12 @@ from jax._src.lax.lax import (
   DotDimensionNumbers,
   GatherDimensionNumbers,
   Precision,
+  RoundingMethod,
   ScatterDimensionNumbers,
   abs,
   abs_p,
   acos,
+  acos_p,
   acosh,
   acosh_p,
   abs,
@@ -40,9 +42,11 @@ from jax._src.lax.lax import (
   argmin,
   argmin_p,
   asin,
+  asin_p,
   asinh,
   asinh_p,
   atan,
+  atan_p,
   atan2,
   atan2_p,
   atanh,
@@ -60,9 +64,9 @@ from jax._src.lax.lax import (
   bitwise_or,
   bitwise_xor,
   broadcast,
+  broadcast_p,
   broadcast_in_dim,
   broadcast_in_dim_p,
-  broadcast_p,
   broadcast_shapes,
   broadcast_to_rank,
   broadcasted_iota,
@@ -150,6 +154,7 @@ from jax._src.lax.lax import (
   integer_pow,
   integer_pow_p,
   iota,
+  iota_p,
   is_finite,
   is_finite_p,
   itertools,
@@ -163,7 +168,6 @@ from jax._src.lax.lax import (
   log_p,
   lt,
   lt_p,
-  lu,
   max,
   max_p,
   min,
@@ -270,6 +274,7 @@ from jax._src.lax.lax import (
   sub,
   sub_p,
   tan,
+  tan_p,
   tanh,
   tanh_p,
   tie_in,
@@ -337,9 +342,9 @@ from jax._src.lax.parallel import (
   psum,
   psum_p,
   pswapaxes,
+  pdot,
 )
-
-# TODO(phawkins): fix callers and remove these imports.
-from . import lax
-from . import lax_parallel
-from . import lax_control_flow
+from jax._src.lax.other import (
+  conv_general_dilated_patches
+)
+from . import linalg

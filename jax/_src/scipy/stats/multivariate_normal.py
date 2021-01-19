@@ -17,14 +17,17 @@ import numpy as np
 import scipy.stats as osp_stats
 
 from jax import lax
-from jax.lax_linalg import cholesky, triangular_solve
 from jax import numpy as jnp
 from jax._src.numpy.util import _wraps
 from jax._src.numpy.lax_numpy import _promote_dtypes_inexact
 
 
-@_wraps(osp_stats.multivariate_normal.logpdf, update_doc=False)
-def logpdf(x, mean, cov):
+@_wraps(osp_stats.multivariate_normal.logpdf, update_doc=False, lax_description="""
+In the JAX version, the `allow_singular` argument is not implemented.
+""")
+def logpdf(x, mean, cov, allow_singular=None):
+  if allow_singular is not None:
+    raise NotImplementedError("allow_singular argument of multivariate_normal.logpdf")
   x, mean, cov = _promote_dtypes_inexact(x, mean, cov)
   if not mean.shape:
     return (-1/2 * jnp.square(x - mean) / cov
@@ -38,8 +41,8 @@ def logpdf(x, mean, cov):
     else:
       if cov.ndim < 2 or cov.shape[-2:] != (n, n):
         raise ValueError("multivariate_normal.logpdf got incompatible shapes")
-      L = cholesky(cov)
-      y = triangular_solve(L, x - mean, lower=True, transpose_a=True)
+      L = lax.linalg.cholesky(cov)
+      y = lax.linalg.triangular_solve(L, x - mean, lower=True, transpose_a=True)
       return (-1/2 * jnp.einsum('...i,...i->...', y, y) - n/2*np.log(2*np.pi)
               - jnp.log(L.diagonal()).sum())
 

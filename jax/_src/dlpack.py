@@ -19,7 +19,7 @@ import jax.lib
 from jax.lib import xla_client
 from jax.lib import xla_bridge
 
-def to_dlpack(x: xla.DeviceArray, take_ownership: bool = False):
+def to_dlpack(x: xla.DeviceArrayProtocol, take_ownership: bool = False):
   """Returns a DLPack tensor that encapsulates a DeviceArray `x`.
 
   Takes ownership of the contents of `x`; leaves `x` in an invalid/deleted
@@ -61,7 +61,9 @@ def from_dlpack(dlpack, backend=None):
   backend = backend or xla_bridge.get_backend()
   client = getattr(backend, "client", backend)
   buf = xla_client._xla.dlpack_managed_tensor_to_buffer(dlpack, client)
-  xla_shape = buf.shape()
+  # TODO(jblespiau): We can simply use buf.xla_shape() when version 0.1.58 is
+  # the default.
+  xla_shape = getattr(buf, "xla_shape", buf.shape)()
   assert not xla_shape.is_tuple()
   aval = core.ShapedArray(xla_shape.dimensions(), xla_shape.numpy_dtype())
-  return xla.DeviceArray(aval, buf.device(), lazy.array(aval.shape), buf)  # pytype: disable=attribute-error
+  return xla.make_device_array(aval, buf.device(), lazy.array(aval.shape), buf)  # pytype: disable=attribute-error

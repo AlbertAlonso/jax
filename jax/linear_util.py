@@ -66,7 +66,11 @@ import threading
 from typing import Any, Tuple, Callable
 import weakref
 
-from .util import curry
+from ._src.util import curry
+
+from ._src import traceback_util
+traceback_util.register_exclusion(__file__)
+
 
 class StoreException(Exception): pass
 
@@ -105,7 +109,7 @@ class Store(object):
 class WrappedFun(object):
   """Represents a function `f` to which `transforms` are to be applied.
 
-  Arguments:
+  Args:
     f: the function to be transformed.
     transforms: a list of `(gen, gen_static_args)` tuples representing
       transformations to apply to `f.` Here `gen` is a generator function
